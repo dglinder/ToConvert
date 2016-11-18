@@ -1,0 +1,60 @@
+#!/bin/bash
+
+###########################################
+# Purpose: list ldap service accounts
+# Author: SDW
+# Incept 09/13/2012
+
+# Notes: - basic LDAP authentication must already be configured and working
+#          on the server where this script is run from
+
+# Set path to the location of the script no matter how it was invoked
+f_Usage () {
+   echo "$0 USAGE"
+   echo ""
+   echo "$0 [-L]"
+   echo ""
+   echo "        If envoked without arguments, provides a list of all"
+   echo "        service account names in LDAP."
+   echo ""
+   echo "   -L   Produces a long getent-style list of ldap Service Accounts"
+   echo ""
+}
+
+if [[ `echo $0 | sed 's/^.\///g'` == `basename $0` ]]; then
+   WORKDIR=`pwd`
+else
+   BASENAME=`basename $0`
+   WORKDIR=`echo $0 | sed 's/'"$BASENAME"'$//g'`
+fi
+
+cd $WORKDIR
+
+# Set some basic options for ldap searching, durrently the directory server doesn't require a binddn or a rootbinddn
+# so simple authentication should work fine
+LDAP_SEARCH="/usr/bin/ldapsearch -x -ZZ"
+
+# find the ldap base
+if [[ -s /etc/ldap.conf ]]; then
+   LDC=/etc/ldap.conf
+elif [[ -s /etc/openldap/ldap.conf ]]; then
+   LDC=/etc/openldap/ldap.conf
+fi
+LDAP_BASE=`egrep -i "^base[ \t]" $LDC | sed 's/^base[ \t]//i'`
+
+if [[ -z $LDAP_BASE ]]; then 
+   echo "Unable to find the base dn for LDAP - please make sure ldap is properly"
+   echo "configured on this machine.  If it IS properly configured and you're"
+   echo "still getting this error, you probably need to update the LDAP_SEARCH"
+   echo "variable in this script to something that works with the current config."
+   exit
+fi
+
+if [[ "$1" == "-L" ]]; then
+   $LDAP_SEARCH -b ou=ServiceAccounts,$LDAP_BASE "(objectClass=posixaccount)" uid uidNumber gidNumber gecos homedirectory loginshell | awk '/uid:/,/loginshell/' | sed ':a;N;$!ba;s/\n/ /g; s/uid: /\n/g; s/ uidNumber: /:/g; s/ gidNumber: /:/g; s/ cn: /:/g; s/ homedirectory: /:/g; s/ loginshell: /:/g; s/ gecos: /:/g'
+elif [[ "$1" == "--help" ]]; then
+   f_Usage
+   exit
+else 
+   $LDAP_SEARCH -b ou=ServiceAccounts,$LDAP_BASE "(objectClass=posixaccount)" uid | egrep -v '^#|^$|^search:|^result|^dn:' | sed 's/^uid: //g'
+fi

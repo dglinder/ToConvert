@@ -1,0 +1,407 @@
+#!/bin/bash
+
+###########################################
+# Purpose: Edit an LDAP service account
+# Author: SDW
+# Incept 09/12/2012
+
+# Notes: - basic LDAP authentication must already be configured and working
+#          on the server where this script is run from
+f_Usage () {
+   echo "$0 USAGE"
+   echo ""
+   echo "$0 <Service Account name>"
+   echo ""
+   echo "   Opens a Service Account up for editing. If an account name is not"
+   echo "   speified on the command line, you will be prompted to provide"
+   echo "   one."
+   echo ""
+   echo "   Note: Service Accounts cannot be re-named. You will need to delete"
+   echo "   the old account and re-create it with the correct name."
+   echo ""
+}
+
+# Set path to the location of the script no matter how it was invoked
+if [[ `echo $0 | sed 's/^.\///g'` == `basename $0` ]]; then
+   WORKDIR=`pwd`
+else
+   BASENAME=`basename $0`
+   WORKDIR=`echo $0 | sed 's/'"$BASENAME"'$//g'`
+fi
+
+cd $WORKDIR
+
+# Set some basic options for ldap searching, durrently the directory server doesn't require a binddn or a rootbinddn
+# so simple authentication should work fine
+LDAP_SEARCH="/usr/bin/ldapsearch -x -ZZ"
+UPDATE_USER=`ldapsearch -x -ZZ "(uid=$USER)" dn | grep ^dn: | sed 's/^dn:[ \t]//'`
+LDAP_MODIFY="/usr/bin/ldapmodify -x -ZZ -D \"$UPDATE_USER\""
+LDAP_BT="$LDAP_SEARCH '(ou=SUDOers)' -D \"$UPDATE_USER\" -w"
+MAXTRIES=5
+
+# Temp file to hold any ldif that we might need to push to the directory
+LDIF_TMP=/eit/admin/scripts/ldap_tools/tmp/.`basename $0`.$$.ldt
+LDIF_IN_TMP=/tmp/$$.sael.$$.ldt
+EDITFILE=/tmp/$$.saef
+BACKUP_DIR=/eit/admin/scripts/ldap_tools/local_backup
+TS=`date +%Y%m%d%H%M%S`
+
+
+# find the ldap base
+if [[ -s /etc/ldap.conf ]]; then
+   LDC=/etc/ldap.conf
+elif [[ -s /etc/openldap/ldap.conf ]]; then
+   LDC=/etc/openldap/ldap.conf
+fi
+LDAP_BASE=`egrep -i "^base[ \t]" $LDC | sed 's/^base[ \t]//i'`
+
+if [[ -z $LDAP_BASE ]]; then 
+   echo "Unable to find the base dn for LDAP - please make sure ldap is properly"
+   echo "configured on this machine.  If it IS properly configured and you're"
+   echo "still getting this error, you probably need to update the LDAP_SEARCH"
+   echo "variable in this script to something that works with the current config."
+   exit
+fi
+
+if [[ -z $UPDATE_USER ]]; then
+   echo "Unable to locate the correct DN for your user account [$USER]."
+   echo "You must be a member of the domain in order to use this script."
+   exit
+fi
+
+
+
+# Get information from the user
+
+SATBE=$1
+
+# If we got a name from the command line
+if [[ -n $SATBE ]]; then
+
+   if [[ "$SATBE" == "--help" ]]; then
+      f_Usage
+      exit
+   fi
+
+   # Verify the netgroup exists
+   if [[ -z `$LDAP_SEARCH -b ou=ServiceAccounts,$LDAP_BASE "(uid=${SATBE})" uid | grep ^uid:` ]]; then
+      echo "ERROR: service account \"$SATBE\" not found in the directory."
+      exit
+   else
+      SATBEDN=`$LDAP_SEARCH -b ou=ServiceAccounts,$LDAP_BASE "(uid=${SATBE})" dn | sed ':a;N;$!ba;s/\n //g' | grep $SATBE | grep ^dn: | sed 's/^dn: //g'`
+   fi
+
+# If we did NOT get a name from the command line 
+else 
+
+   # Prompt the user for a name
+   VC2=FALSE
+   while [[ $VC2 == FALSE ]]; do
+      unset GSATBE
+      read -p "What is the name of the service account to be edited?: " GSATBE
+
+      # Check for non-existence - retry on error
+      if [[ -z `$LDAP_SEARCH -b ou=ServiceAccounts,$LDAP_BASE "(uid=${GSATBE})" uid | grep ^uid:` ]]; then
+         echo "ERROR: user \"$GSATBE\" not found in the directory."
+         read -p "Press Enter to try a different name, Ctrl+C to cancel." JUNK
+         tput uu1; tput el; tput uu1; tput el; tput uu1; tput el
+      else
+         VC2=TRUE
+         SATBE=$GSATBE
+         SATBEDN=`$LDAP_SEARCH -b ou=ServiceAccounts,$LDAP_BASE "(uid=${SATBE})" dn | sed ':a;N;$!ba;s/\n //g' | grep $SATBE | grep ^dn: | sed 's/^dn: //g'`
+      fi
+   done
+fi
+
+# Output the user's ldap entry to a temp file
+
+#$LDAP_SEARCH -b ou=ServiceAccounts,$LDAP_BASE "(uid=${SATBE})" | egrep -v '^#|^$|^search|^result' | sed ':a;N;$!ba;s/\n //g'> $LDIF_IN_TMP
+$LDAP_SEARCH -b "$SATBEDN" | egrep -v '^#|^$|^search|^result' | sed ':a;N;$!ba;s/\n //g'> $LDIF_IN_TMP
+
+# Start the edit file
+
+echo "#### SERVICE ACCOUNT NAME ############" > $EDITFILE
+echo "# DO NOT CHANGE SERVICE ACCOUNT NAME" >> $EDITFILE
+echo "######################################" >> $EDITFILE
+echo "SA_NAME: $SATBE" >> $EDITFILE
+echo "" >> $EDITFILE
+
+# Editable attributes are:
+# uidNumber
+# gidNumber
+# gecos
+# mail
+# loginShell
+# homeDirectory
+
+
+#Mandatory
+if [[ -n `grep -i '^uidNumber:' $LDIF_IN_TMP` ]]; then
+   grep -i '^uidNumber:' $LDIF_IN_TMP | sed 's/^uidNumber:/UNIX_UID:/gI' >> $EDITFILE
+else
+   echo "UNIX_UID: " >> $EDITFILE
+fi
+
+if [[ -n `grep -i '^gidNumber:' $LDIF_IN_TMP` ]]; then
+   grep -i '^gidNumber:' $LDIF_IN_TMP | sed 's/^gidNumber:/UNIX_GID:/gI' >> $EDITFILE
+else
+   echo "UNIX_GID: " >> $EDITFILE
+fi
+if [[ `grep -i '^homeDirectory:' $LDIF_IN_TMP` ]]; then
+   grep -i '^homeDirectory:' $LDIF_IN_TMP | sed 's/^homeDirectory:/HOME_DIR:/gI' >> $EDITFILE
+else
+   echo "HOME_DIR: " >> $EDITFILE
+fi
+
+#Optional
+if [[ -n `grep -i '^gecos:' $LDIF_IN_TMP` ]]; then
+   grep -i '^gecos:' $LDIF_IN_TMP | sed 's/^gecos:/GECOS:/gI' >> $EDITFILE
+else
+   echo "GECOS: " >> $EDITFILE
+fi
+if [[ -n `grep -i '^loginShell:' $LDIF_IN_TMP` ]]; then
+   grep -i '^loginShell:' $LDIF_IN_TMP | sed 's/^loginShell:/SHELL:/gI' >> $EDITFILE
+else
+   echo "SHELL: " >> $EDITFILE
+fi
+echo "" >> $EDITFILE
+
+
+# The editable update file has been built, now we need to record the md5sum
+# so we can tell if it was changed.
+
+BEFORE_MD5=`md5sum $EDITFILE | awk '{print $1}'`
+
+# keep editing the file until the user quits or verification passes
+VERIFIED=FALSE
+while [[ $VERIFIED == FALSE ]]; do
+
+
+   vim $EDITFILE
+
+   # Next, check the file for updates
+
+   AFTER_MD5=`md5sum $EDITFILE | awk '{print $1}'`
+
+   if [[ "$AFTER_MD5" == "$BEFORE_MD5" ]]; then
+      echo "No changes made - nothing to update."
+      /bin/rm $EDITFILE
+      /bin/rm $LDIF_IN_TMP
+      exit
+   fi
+
+   # If updates were found, then check them
+
+
+   echo ""
+   echo "Checking the edited file for errors..."
+   echo ""
+   
+
+   # Start with the assumption that everything checks out.  Any one
+   # Failure will change this value
+   FAILURE=NO
+
+   # Check name
+   echo "Checking Name"
+   SAN=`grep "^SA_NAME:" $EDITFILE | sed 's/^SA_NAME: //; s/^SA_NAME://'`
+   if [[ $SAN != $SATBE ]]; then
+      echo "Error: SA_NAME does not match the service account being edited!"
+      FAILURE=YES
+   fi
+  
+   # Check uidNumber - make sure it's there and some other user doesn't have this uid
+   if [[ -z `grep "^UNIX_UID:" $EDITFILE | sed 's/^UNIX_UID: //g; s/^UNIX_UID://g'` ]]; then
+      echo "Error: UNIX_UID is a required attribute"
+      FAILURE=YES
+   else
+      OUIDNUM=`grep "^UNIX_UID:" $EDITFILE | sed 's/^UNIX_UID: //g; s/^UNIX_UID://g'`
+      unset HASUIDNUM
+      HASUIDNUM=`$LDAP_SEARCH -b $LDAP_BASE '(&(uidNumber='"${OUIDNUM}"')(!(uid='"${SATBE}"')))' uid | grep ^uid: | sed 's/^uid: //g'`
+      if [[ -n $HASUIDNUM ]]; then
+         echo "Error: UNIX_UID $OUIDNUM is already in use by $HASUIDNUM"
+         FAILURE=YES
+      fi
+      
+   fi
+
+   # Check gidNumber - make sure it's there
+   if [[ -z `grep "^UNIX_GID:" $EDITFILE | sed 's/^UNIX_GID: //g; s/^UNIX_GID://g'` ]]; then
+      echo "Error: UNIX_GID is a required attribute"
+      FAILURE=YES
+   else
+      OGIDNUM=`grep "^UNIX_GID:" $EDITFILE | sed 's/^UNIX_GID: //g; s/^UNIX_GID://g'`
+   fi
+
+   # Check homeDirectory - make sure it's there
+   if [[ -z `grep "^HOME_DIR:" $EDITFILE | sed 's/^HOME_DIR: //g; s/^HOME_DIR://g'` ]]; then
+      echo "Error: HOME_DIR is a required attribute"
+      FAILURE=YES
+   else
+      OHOMEDIR=`grep "^HOME_DIR:" $EDITFILE | sed 's/^HOME_DIR: //g; s/^HOME_DIR://g'`
+   fi
+
+   # gecos, and loginshell are all optional
+
+   OGECOS=`grep "^GECOS:" $EDITFILE | sed 's/^GECOS: //g; s/^GECOS://g'`   
+   OSHELL=`grep "^SHELL:" $EDITFILE | sed 's/^SHELL: //g; s/^SHELL://g'`   
+
+   # Check for duplicate lines - LDAP ADD will fail even on arbitrary fields
+   # If the same value is specified more than once for any attribute
+   if [[ -n `cat $EDITFILE | uniq -d` ]]; then
+      echo "Error: duplicate instances of the following line detected"
+      cat $EDITFILE | uniq -d | sed 's/^/       /g'
+      FAILURE=YES
+   fi
+
+
+
+   # Now, check to see if we failed at any point
+   if [[ $FAILURE == YES ]]; then
+      echo ""
+      echo "Unable to apply the changes because of the errors above."
+      read -p "Enter \"e\" to edit the file, anything else to quit: " ERRORCHOICE
+      if [[ "$ERRORCHOICE" != "e" ]] && [[ "$ERRORCHOICE" != "E" ]]; then
+         /bin/rm $EDITFILE
+         exit
+      fi
+   else
+      VERIFIED=TRUE
+   fi
+
+
+done
+
+echo "Verification passed.  Applying update."
+
+# Build our LDIF based on the new information, we'll be replacing the values
+# with whatever was read in from the edited file
+
+if [[ -f $LDIF_TMP ]]; then
+   /bin/rm $LDIF_TMP
+fi
+
+
+# Specify the DN of the SUDO role to be edited and specify that we're modifying it
+echo "dn: $SATBEDN" > $LDIF_TMP
+echo "changetype: modify" >> $LDIF_TMP
+
+# Make sure this is a posix account - it's possible that it isn't yet.
+
+if [[ -z `grep -i ^objectClass: $LDIF_IN_TMP | grep -i posixAccount` ]]; then
+   echo "add: objectClass" >> $LDIF_TMP
+   echo "objectClass: posixAccount" >> $LDIF_TMP
+   echo "-" >> $LDIF_TMP
+fi
+
+# Required fields - we still have to test if they exist because
+# the account may not have been a posix account to start with.
+
+# UNIX_UID
+if [[ -n `grep -i ^uidNumber:  $LDIF_IN_TMP` ]]; then
+   echo "replace: uidNumber" >> $LDIF_TMP
+else
+   echo "add: uidNumber" >> $LDIF_TMP
+fi
+echo "uidNumber: $OUIDNUM" >> $LDIF_TMP
+echo "-" >> $LDIF_TMP
+
+# UNIX_GID
+if [[ -n `grep -i ^gidNumber:  $LDIF_IN_TMP` ]]; then
+   echo "replace: gidNumber" >> $LDIF_TMP
+else
+   echo "add: gidNumber" >> $LDIF_TMP
+fi
+echo "gidNumber: $OGIDNUM" >> $LDIF_TMP
+echo "-" >> $LDIF_TMP
+
+# HOME_DIR
+if [[ -n `grep -i ^homeDirectory:  $LDIF_IN_TMP` ]]; then
+   echo "replace: homeDirectory" >> $LDIF_TMP
+else
+   echo "add: homeDirectory" >> $LDIF_TMP
+fi
+echo "homeDirectory: $OHOMEDIR" >> $LDIF_TMP
+echo "-" >> $LDIF_TMP
+
+#Optional stuff
+
+# GECOS
+if [[ -n `grep -i ^gecos:  $LDIF_IN_TMP` ]]; then
+   echo "delete: gecos" >> $LDIF_TMP
+   echo "-" >> $LDIF_TMP
+fi
+if [[ -n $OGECOS ]]; then
+   echo "add: gecos" >> $LDIF_TMP
+   echo "gecos: $OGECOS" >> $LDIF_TMP  
+   echo "-" >> $LDIF_TMP
+fi
+
+# SHELL
+if [[ -n `grep -i ^loginShell:  $LDIF_IN_TMP` ]]; then
+   echo "delete: loginShell" >> $LDIF_TMP
+   echo "-" >> $LDIF_TMP
+fi
+if [[ -n $OSHELL ]]; then
+   echo "add: loginShell" >> $LDIF_TMP
+   echo "loginShell: $OSHELL" >> $LDIF_TMP
+   echo "-" >> $LDIF_TMP
+fi
+
+# Make a backup of the object
+if [[ ! -d $BACKUP_DIR ]]; then
+   mkdir -p $BACKUP_DIR
+fi
+LDIF_BAK=${BACKUP_DIR}/sa_edited_${SATBE}_${TS}.ldif
+
+echo "## Script Name: $0" > $LDIF_BAK
+echo "## Executed By/From: `/usr/bin/who -m`" >> $LDIF_BAK
+echo "##" >> $LDIF_BAK
+echo "## Object Before Modification:" >> $LDIF_BAK
+
+# Back up the object
+$LDAP_SEARCH -b ou=ServiceAccounts,$LDAP_BASE "(uid=${SATBE}" 2>&1 | egrep -v '^#|^$|^search|^result' >> $LDIF_BAK
+
+if [[ ! -s $LDIF_BAK ]]; then
+   echo "Error: there was a problem creating the backup file for $SATBE"
+   exit
+fi
+
+echo "## Attempted Modification:" >> $LDIF_BAK
+echo "##" >> $LDIF_BAK
+cat $LDIF_TMP | sed 's/^/#/g' >> $LDIF_BAK
+
+
+# Verify LDAP password
+VP=FALSE
+TRIES=0
+while [[ $VP == FALSE ]] && [[ $TRIES -le $MAXTRIES ]]; do
+   read -sp "LDAP Password ($UPDATE_USER): " UUP
+   echo "$LDAP_BT \"$UUP\"" | /bin/bash 2>&1 >/dev/null
+   if [[ $? != 0 ]]; then
+      unset UUP
+      let TRIES=$TRIES+1
+   else
+      echo ""
+      VP=TRUE
+   fi
+done
+
+
+echo "$LDAP_MODIFY -w \"$UUP\" -a -f $LDIF_TMP " | /bin/bash
+if [[ $? != 0 ]]; then
+   echo "There was an error adding the object(s)"
+   echo "The command that failed was:"
+   echo "   $LDAP_MODIFY -W -a -f $LDIF_TMP"
+   echo ""
+   echo "## Update failed" >> $LDIF_BAK
+   exit
+fi
+
+echo "## Update succeeded" >> $LDIF_BAK
+/bin/rm $LDIF_TMP
+
+exit
+echo "Updated $SATBE:"
+$LDAP_SEARCH -b ou=ServiceAccounts,$LDAP_BASE "(uid=${SATBE})" 2>&1 | egrep -v '^#|^$|^search|^result'
+

@@ -1,0 +1,62 @@
+#############################################
+# Purpose: West ETS baseline RHEL5 IPtables configuration.  Managed by Ansible.
+# Author: DGL
+# Revision: $Rev$
+# Updated by: $Author$
+# Last change date: $LastChangedDate$
+# SVN URL: $HeadURL$
+#############################################
+#
+*mangle
+:PREROUTING ACCEPT [93678:326881049]
+:INPUT ACCEPT [93398:326843928]
+:FORWARD ACCEPT [0:0]
+:OUTPUT ACCEPT [45476:2723830]
+##########
+# Begin West QoS settings
+:POSTROUTING ACCEPT [45476:2723830]
+-A POSTROUTING -p tcp -m tcp --dport 1500:1530 -j DSCP --set-dscp 0x0e 
+-A POSTROUTING -p tcp -m tcp --dport 13782 -j DSCP --set-dscp 0x0e 
+COMMIT
+# End West QoS settings
+##########
+*filter
+:INPUT ACCEPT [0:0]
+:FORWARD ACCEPT [0:0]
+:OUTPUT ACCEPT [0:0]
+-A INPUT -i lo -j ACCEPT 
+-A INPUT -m state --state RELATED,ESTABLISHED -j ACCEPT 
+##########
+# Permit SSH
+-A INPUT -p tcp -m tcp --dport 22 -j ACCEPT 
+##########
+# Hyperic agent ports
+-A INPUT -p tcp -m tcp --dport 2443 -j ACCEPT 
+-A INPUT -p tcp -m tcp --dport 2144 -j ACCEPT 
+##########
+# Legacy rejected ports
+-A INPUT -p tcp -m tcp --dport 21 -j REJECT --reject-with icmp-port-unreachable 
+-A INPUT -p tcp -m tcp --dport 23 -j REJECT --reject-with icmp-port-unreachable 
+-A INPUT -p tcp -m tcp --dport 512 -j REJECT --reject-with icmp-port-unreachable 
+-A INPUT -p tcp -m tcp --dport 513 -j REJECT --reject-with icmp-port-unreachable 
+-A INPUT -p tcp -m tcp --dport 514 -j REJECT --reject-with icmp-port-unreachable 
+-A INPUT -p tcp -m tcp --dport 1022 -j REJECT --reject-with icmp-port-unreachable 
+-A INPUT -p tcp -m tcp --dport 1023 -j REJECT --reject-with icmp-port-unreachable 
+-A INPUT -p icmp --icmp-type timestamp-request -j DROP
+
+##########
+# Legacy permit any inbound rule.
+-A INPUT -j ACCEPT 
+##########
+# Legacy rejected outbound ports.
+-A OUTPUT -p tcp -m tcp --dport 1022 -j REJECT --reject-with icmp-port-unreachable 
+-A OUTPUT -p tcp -m tcp --dport 1023 -j REJECT --reject-with icmp-port-unreachable 
+-A OUTPUT -p tcp -m tcp --dport 514 -j REJECT --reject-with icmp-port-unreachable 
+-A OUTPUT -p tcp -m tcp --dport 513 -j REJECT --reject-with icmp-port-unreachable 
+-A OUTPUT -p tcp -m tcp --dport 512 -j REJECT --reject-with icmp-port-unreachable 
+-A OUTPUT -p icmp --icmp-type timestamp-reply -j DROP
+
+##########
+# Legacy permit any outbound rule.
+-A OUTPUT -j ACCEPT 
+COMMIT

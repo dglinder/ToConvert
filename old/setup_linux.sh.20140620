@@ -1,0 +1,222 @@
+#!/bin/bash 
+
+# Purpose: Apply standardized configuration to new Linux build
+# Incept: 2013/12/27
+# Author: SDW
+# VERSION: 20131227a
+
+
+#################FUNCTION DEFINITIONS########################
+
+# Include common_functions.h
+if [[ -s /maint/scripts/common_functions.h ]]; then
+   source /maint/scripts/common_functions.h
+elif [[ -s common_functions.h ]]; then
+   source common_functions.h
+else
+   echo "Critical dependency failure: unable to locate common_functions.h"
+   exit
+fi
+
+export LOGFILE=/var/log/install/setup_linux.log
+if [[ ! -d /var/log/install ]]; then mkdir -p /var/log/install; fi
+f_SetLogLevel 0
+export VTS="date +%Y%m%d%H%M%S"
+
+SCRIPT_DIR=/maint/scripts
+COMPLETION_FILE=/root/.setup_linux.sh.complete
+
+trap "exit 1" TERM
+export SPID=$$
+
+################END FUNCTION DEFINITIONS#####################
+
+################PRE-CHECKS###################################
+
+if [[ $EUID != 0 ]]; then
+   echo "FAILURE: This script must be run as root or with equivalent privilege."
+   echo "         This system HAS NOT been configured for LDAP."
+   exit 2
+fi
+
+
+################END PRE-CHECKS###############################
+
+# if the argument '--reset' is given, the script's step file will be deleted
+if [[ -n $1 ]] && [[ "$1" == "--reset" ]]; then
+   /bin/rm `f_getStepFile`
+fi
+
+# Each action, whether it's the name of a script or a function
+# must be run as a step # to make sure the process is resumable
+
+# The last successful step is recorded to a file.  Steps that 
+# were completed successfully on previous runs will be skipped
+
+# Configure the Network
+f_runStep 100 "${SCRIPT_DIR}/setup_network.sh"
+
+# Configure DNS (will exit 0 without changes if in the DMZ)
+f_runStep 200 "${SCRIPT_DIR}/setup_dns.sh"
+
+# Query the admin for setup details about the server
+f_runStep 300 "${SCRIPT_DIR}/setup_statement_of_origin.sh"
+
+# Check/Fix hostname
+f_runStep 400 "${SCRIPT_DIR}/setup_hostname.sh"
+
+# Configure MOTD
+f_runStep 500 "${SCRIPT_DIR}/setup_motd.sh"
+
+# Set up default files and directories
+f_runStep 600 "${SCRIPT_DIR}/setup_files_and_dirs.sh"
+
+# Set up default local accounts
+f_runStep 700  "${SCRIPT_DIR}/setup_default_accounts.sh"
+
+# Configure LDAP
+f_runStep 800 "${SCRIPT_DIR}/setup_ldap.sh"
+
+# Configure NTP
+f_runStep 900 "${SCRIPT_DIR}/setup_ntp.sh"
+
+# Set up Big Brother
+f_runStep 1000 "${SCRIPT_DIR}/setup_bb.sh"
+
+# Configure syslog
+f_runStep 1100 "/opt/configure_syslog.sh"
+
+# Setup services
+f_runStep 1200 "${SCRIPT_DIR}/setup_services.sh"
+
+# Setup iptables
+f_runStep 1300 "${SCRIPT_DIR}/setup_iptables.sh"
+
+# Setup IBM Director
+f_runStep 1400 "${SCRIPT_DIR}/setup_hw_tools.sh"
+
+
+
+# Send post-setup email message
+
+if [[ -f "$COMPLETION_FILE" ]]; then
+   echo "It appears that $0 has previously been completed on this server."
+   echo "This means that a notification email has already been sent."
+   read -p "Would you like to re-send the notification email? (Y to re-send, anything else to quit): " RESEND
+   if [[ -z `echo $RESEND | grep -i "^Y"` ]]; then
+      exit 0
+   fi
+fi
+   
+
+# Read the system's identify information from the SSO
+SSO=/etc/sso
+if [[ ! -s $SSO ]]; then
+   echo "`$VTS`:$0:Failure - The server statement of origin is missing or empty - rerun setup_statement_of_origin.sh" | $LOG1
+   exit 20
+fi  
+
+# Required Values
+RVLIST="SITENUM SITENAME BU EITSUPPORT ITC PURPOSE"
+RVPASS=YES
+for RV in $RVLIST; do
+   if [[ -z `grep "^${RV}=" $SSO` ]]; then
+      echo "`$VTS`:$0:Failure - $RV is missing from the server statement of origin" | $LOG1  
+      echo "   $RV is missing from $SSO"
+      RVPASS=NO
+   fi
+done
+
+if [[ $RVPASS == NO ]]; then
+   echo "`$VTS`:$0:Failure - The server statement of origin is incomplete - rerun setup_statement_of_origin.sh" | $LOG1
+   echo "Failure! The server statement of origin is incomplete - rerun setup_statement_of_origin.sh"
+   exit 21
+fi
+   
+# Read values
+VA=`grep "^VA=" $SSO | awk -F'=' '{print $2}'`
+NVA=`grep "^NVA=" $SSO | awk -F'=' '{print $2}'`
+VAFN=`grep "^VAFN=" /etc/sso | awk -F'=' '{print $2}'`
+SITENUM=`grep "^SITENUM=" /etc/sso | awk -F'=' '{print $2}'`
+SITENAME=`grep "^SITENAME=" /etc/sso | awk -F'=' '{print $2}'`
+BU=`grep "^BU=" /etc/sso | awk -F'=' '{print $2}'`
+EITSUPPORT=`grep "^EITSUPPORT=" /etc/sso | awk -F'=' '{print $2}'`
+ITC=`grep "^ITC=" /etc/sso | awk -F'=' '{print $2}'`
+VCN=`grep "^VCN=" /etc/sso | awk -F'=' '{print $2}'`
+PURPOSE=`grep "^PURPOSE=" /etc/sso | awk -F'=' '{print $2}'`
+
+# Admin string
+if [[ -n $VA ]]; then
+   ASTRING="$VAFN($VA)"
+else
+   ASTRING="$NVA(Not Validated)"
+fi
+
+# Get enviromental details
+if [[ `f_DetectVM` != TRUE ]]; then
+   TYPESTRING=PHYSICAL
+else
+   TYPESTRING="VIRTUAL[$VCN]"
+fi
+LNAME=`hostname -s`
+LIP=`f_FindPubIP`
+
+# Check the status of the sendmail daemon
+SMSTATUS=`/etc/init.d/sendmail status | head -1 | awk '{print $NF}'`
+
+# Start or restart the daemon as necessary
+if [[ "$SMSTATUS" == "stopped" ]]; then
+   /etc/init.d/sendmail start 2>&1 | >> /dev/null
+else
+   /etc/init.d/sendmail restart 2>&1 | >> /dev/null
+fi
+
+# Log the intended mail message
+echo "`$VTS` Sending the following email message with subject \"request\" to servicedesk@west.com" >> $LOGFILE
+echo "`$VTS` %CUSTOMER=${BU}
+%CATEGORY=Enterprise.Hardware.New.Server.Unix
+%GROUP=EIT Server Operations
+%SUMMARY=Please perform post-install verification for $LNAME ($LIP).  $SITENAME $PURPOSE
+%DESCRIPTION=The server $LNAME ($LIP) has just completed the imaging process. Please follow standard EIT post-server validation steps to ensure that it is ready, including, but not limited to - verifying the LDAP(EOD) machine netgroup, verifying IBM director (where applicable), ensure the server has been entered into the hardware database, DNS, hosts, etc... Server Details: Location=$SITENAME, Purpose=$PURPOSE, BU=$BU, EIT Supported=$EITSUPPORT, On Intercall's Domain=$ITC, TYPE=$TYPESTRING, Installing Administrator=$ASTRING
+%PROPERTY={{Requesting Department}}_NA
+%PROPERTY={{Site to be installed}}_NA
+%PROPERTY={{Type of Server}}_NA
+%PROPERTY={{Status of Equipment}}_NA
+%PROPERTY={{Date Needed by:}}_NA
+%FROM_EMAIL=Hardware_Build" >> $LOGFILE
+
+# Send the mail to unicenter to open the ticket.
+#
+
+echo "Sending notification email to servicedesk@west.com"
+echo "%CUSTOMER=${BU}
+%CATEGORY=Enterprise.Hardware.New.Server.Unix
+%GROUP=EIT Server Operations
+%SUMMARY=Please perform post-install verification for $LNAME ($LIP).  $SITENAME $PURPOSE
+%DESCRIPTION=The server $LNAME ($LIP) has just completed the imaging process. Please follow standard EIT post-server validation steps to ensure that it is ready, including, but not limited to - verifying the LDAP(EOD) machine netgroup, verifying IBM director (where applicable), ensure the server has been entered into the hardware database, DNS, hosts, etc... Server Details: Location=$SITENAME, Purpose=$PURPOSE, BU=$BU, EIT Supported=$EITSUPPORT, On Intercall's Domain=$ITC, TYPE=$TYPESTRING, Installing Administrator=$ASTRING
+%PROPERTY={{Requesting Department}}_NA
+%PROPERTY={{Site to be installed}}_NA
+%PROPERTY={{Type of Server}}_NA
+%PROPERTY={{Status of Equipment}}_NA
+%PROPERTY={{Date Needed by:}}_NA
+%FROM_EMAIL=Hardware_Build" | mail -s "request" servicedesk@west.com
+
+RETVAL=$?
+
+if [[ $RETVAL -ne 0 ]]; then
+   echo "`$VTS`:$0 failed to send email." >> $LOGFILE
+else
+   echo "`$VTS`:New Server Setup for $LNAME completed successfully." >> $LOGFILE
+   echo "New Server Setup for $LNAME completed successfully."
+fi
+
+# Remove the trigger from root's profile
+sed -i '/setup_linux.sh/d' /root/.bash_profile
+
+# Drop a "setup_completed" file in root's home directory
+touch /root/.setup_linux.sh.complete
+
+echo "Cleanup finished. Please complete post setup steps."
+
+
+

@@ -1,0 +1,482 @@
+#!/bin/bash
+
+###########################################
+# Purpose: list netgroups, members etc...
+# Author: SDW
+# Incept 08/08/2012
+
+# Notes: - basic LDAP authentication must already be configured and working
+#          on the server where this script is run from
+
+f_Usage () {
+   echo "lsnetgroup USAGE"
+   echo ""
+   echo "   lsnetgroup [-l|-L]"
+   echo ""
+   echo "      OR"
+   echo ""
+   echo "   lsnetgroup [-n|-n1|-N|-N1|-m|-m1|-M|-M1|-d] <NETGROUP>"
+   echo ""
+   echo "      OR"
+   echo ""
+   echo "   lsnetgroup [-u|-u1|-U|-U1] <USER>"
+   echo ""
+   echo "      OR"
+   echo ""
+   echo "   lsnetgroup [-h|-h1|-H|-H1] <HOST>"
+   echo ""
+   echo "      [1]  Adding "1" to options -n, -N, -m, -M, -u, or -U"
+   echo "           causes output to be printed in a single column."
+   echo ""
+   echo "           Example: "
+   echo "              lsnetgroup -n1 <NETGROUP>"
+   echo ""
+   echo "           Prints all users who are members of <NETGROUP>"
+   echo "           in a single column."
+   echo ""
+   echo "      -l   list all netgroups"
+   echo ""
+   echo "      -L   list all netgroups with descriptions"
+   echo ""
+   echo "      -n   Print all users who are members of <NETGROUP>"
+   echo ""
+   echo "      -N   Print all users who are members of <NETGROUP>"
+   echo "           and include membership via nested netgroups."
+   echo ""
+   echo "      -m   Print all netgroups which are members of"
+   echo "           <NETGROUP>"
+   echo ""
+   echo "      -M   Print all netgroups which have <NETGROUP> as"
+   echo "           a member"
+   echo ""
+   echo "      -d   Print the description for <NETGROUP>."
+   echo ""
+   echo "      -u   Print all netgroups <USER> is a member of."
+   echo ""
+   echo "      -U   Print all netgroups <USER> is a member of,"
+   echo "           include nested netgroups."
+   echo ""
+   echo "      -h   Print all netgroups <HOST> is a member of."
+   echo ""
+   echo "      -H   Print all netgroups <HOST> is a member of,"
+   echo "           include nested netgroups."
+   echo ""
+
+}
+
+# Set path to the location of the script no matter how it was invoked
+if [[ `echo $0 | sed 's/^.\///g'` == `basename $0` ]]; then
+   WORKDIR=`pwd`
+else
+   BASENAME=`basename $0`
+   WORKDIR=`echo $0 | sed 's/'"$BASENAME"'$//g'`
+fi
+
+cd $WORKDIR
+
+# Set some basic options for ldap searching, durrently the directory server doesn't require a binddn or a rootbinddn
+# so simple authentication should work fine
+LDAP_SEARCH="/usr/bin/ldapsearch -x -ZZ -LL"
+LDAP_MODIFY='/usr/bin/ldapmodify -x -ZZ -LL -W -D "cn=Directory Manager"'
+
+# find the ldap base
+if [[ -s /etc/ldap.conf ]]; then
+   LDC=/etc/ldap.conf
+elif [[ -s /etc/openldap/ldap.conf ]]; then
+   LDC=/etc/openldap/ldap.conf
+fi
+LDAP_BASE=`egrep -i "^base[ \t]" $LDC | sed 's/^base[ \t]//i'`
+
+if [[ -z $LDAP_BASE ]]; then 
+   echo "Unable to find the base dn for LDAP - please make sure ldap is properly"
+   echo "configured on this machine.  If it IS properly configured and you're"
+   echo "still getting this error, you probably need to update the LDAP_SEARCH"
+   echo "variable in this script to something that works with the current config."
+   exit
+fi
+
+# Look for a "Netgroups" OU at the base level
+NG_BASE=`$LDAP_SEARCH '(ou=Netgroups)' | grep "dn: ou" | awk '{print $2}'`
+
+# If there is no Netgroups OU then print an error and exit
+if [[ -z $NG_BASE ]]; then 
+  echo "No Netgroup OU was found at $LDAP_BASE..."
+  echo "Please run the appropriate script from directory-setup"
+  echo "and try again."
+  exit
+fi
+
+# if we only got one argument then it's probably a listing
+if [[ $# == 1 ]]; then
+   if [[ "$1" == "-l" ]]; then
+      $LDAP_SEARCH -b $NG_BASE "(objectClass=nisnetgroup)" cn | grep ^cn: | sed 's/^cn:[ \t]//g' | grep -v ^defaults | sort -t _ -k2
+   elif [[ "$1" == "-L" ]]; then
+      for NG in `$LDAP_SEARCH -b $NG_BASE "(objectClass=nisnetgroup)" cn | grep ^cn: | sed 's/^cn:[ \t]//g' | grep -v ^defaults | sort -t _ -k2`; do
+         unset DSTRING
+         DSTRING=`$LDAP_SEARCH -b $NG_BASE "(cn=${NG})" description | sed ':a;N;$!ba;s/\n //g' | grep ^description:`
+         if [[ -n `echo $DSTRING | grep -i "^description::"` ]]; then
+            BASE64DESC=`echo $DSTRING | grep -i "^description::" | sed 's/^description:://i'`
+            DESC=`echo $BASE64DESC | perl -MMIME::Base64 -0777 -ne 'print decode_base64($_)'`
+         else
+            DESC=`echo $DSTRING | grep -i "^description:" | sed 's/^description://i'`
+         fi
+         if [[ -n $DESC ]]; then
+            echo "$NG ($DESC )"
+         else
+            echo "$NG"
+         fi
+      done
+   else
+      f_Usage
+      exit
+   fi
+# if we got more than one argument
+elif [[ $# == 2 ]]; then
+
+   MODE=$1
+   SS=$2
+
+
+   if [[ "$MODE" == "-d" ]]; then
+      # Show the description for the given netgroup
+      if [[ -n `$LDAP_SEARCH -b $NG_BASE "(cn=${SS})" cn 2>&1 | grep "^cn:"` ]]; then
+         DSTRING=`$LDAP_SEARCH -b $SUDO_BASE "(cn=${SR})" description | egrep -v '^dn:|^#|^$|^search:|^result:' | sed 's/^ //g' | sed ':a;N;$!ba;s/\n //g'`
+         if [[ -n `echo $DSTRING | grep -i "^description::"` ]]; then
+            BASE64DESC=`echo $DSTRING | grep -i "^description::" | sed 's/^description:://i'`
+            DESC=`echo $BASE64DESC | perl -MMIME::Base64 -0777 -ne 'print decode_base64($_)'`
+         else
+            DESC=`echo $DSTRING | grep -i "^description:" | sed 's/^description://i'`
+         fi
+         if [[ -n $DESC ]]; then
+            echo "$DESC"
+         else
+            echo "No description found for $SS."
+         fi
+      else
+         echo "Netgroup \"$SS\" not found."
+      fi
+
+   elif [[ "$MODE" == "-n" ]] || [[ "$MODE" == "-n1" ]]; then
+      # List all members of a given netgroup
+      
+      # Make sure the netgroup actually exists
+      if [[ -n `$LDAP_SEARCH -b $NG_BASE "(cn=${SS})" 2>&1 | egrep -v '^#|^$|^search|^result'` ]]; then
+         # Pull all of the nisNetgroupTriple entries and echo them to the screen
+         #members=`$LDAP_SEARCH -b $NG_BASE "(cn=${SS})" 2>&1 | egrep -v '^#|^$|^search|^result' | grep ^nisNetgroupTriple | awk -F',' '{print $2}'`
+         members=`$LDAP_SEARCH -b $NG_BASE "(cn=${SS})" 2>&1 | egrep -v '^#|^$|^search|^result' | grep ^nisNetgroupTriple | sed 's/^nisNetgroupTriple: //g; s/(,//g; s/(-,//g; s/(//g; s/,-,)//g; s/,)//g; s/,,)//g'`
+
+         # No point in doing work if there are no members
+         if [[ -n $members ]]; then 
+            # If the option has a 1 after it, then show everything on one line
+            if [[ "$MODE" == "-n1" ]]; then
+               for member in $members; do echo $member; done
+            else
+               # if there is no 1 next to the option, then use sed to remove return characters
+               for member in $members; do echo $member; done | sed ':a;N;$!ba;s/\n/ /g'
+            fi
+         fi
+      else
+         echo "Netgroup \"$SS\" not found."
+      fi
+
+
+   elif [[ "$MODE" == "-N" ]] || [[ "$MODE" == "-N1" ]]; then
+
+      # List all members of a given netgroup include members of nested netgroups
+
+      # Make sure the netgroup actually exists
+      if [[ -n `$LDAP_SEARCH -b $NG_BASE "(cn=${SS})" 2>&1 | egrep -v '^#|^$|^search|^result'` ]]; then
+         # Pull all of the nisNetgroupTriple entries and echo them to the screen
+         members=`$LDAP_SEARCH -b $NG_BASE "(cn=${SS})" 2>&1 | egrep -v '^#|^$|^search|^result' | grep ^nisNetgroupTriple |  sed 's/^nisNetgroupTriple: //g; s/(,//g; s/(-,//g; s/(//g; s/,-,)//g; s/,)//g;s/,,)//g'`
+         # Find all other netgroups that are a member of this one
+         ngmembers=`$LDAP_SEARCH -b $NG_BASE "(cn=${SS})" | grep "^memberNisNetgroup" | awk '{print $NF}'`
+
+         # Crawl the list of netgroups and find all nested members
+         ngfound=$ngmembers
+
+         # We'll use this variable to indicate when we have reached the end of the nesting
+         unset bottom
+
+         # Keep looping until the "bottom" of the nesting is found.
+         while [[ -z $bottom ]]; do
+
+            # Add the results of the last check "nested" to the total list of netgroups
+            ngfound="$ngfound $nested"
+
+            #create a filter with the name of each known netgroup so we do not add any to the list that already exist
+            unset filter
+            for mng1 in $ngfound; do
+               if [[ -z $filter ]]; then
+                  filter="${mng1}$"
+               else
+                  filter="${filter}|${mng1}$"
+               fi
+            done
+
+            #search each known netgroup for nested membership, but exclude the ones we already know about with the filter
+            unset nested
+            for mng2 in $ngfound; do
+
+               # If there are further nested memberships then add them to the "nested" list
+               if [[ -n `$LDAP_SEARCH -b $NG_BASE "(cn=${mng2})" | grep "^memberNisNetgroup" | egrep -v "$filter"` ]]; then
+                  if [[ -z $nested ]];then
+                     nested=`$LDAP_SEARCH -b $NG_BASE "(cn=${mng2})" | grep "^memberNisNetgroup" | awk '{print $NF}' | egrep -v "$filter"`
+                  else
+                     nested="$nested `$LDAP_SEARCH -b $NG_BASE "(cn=${mng2})" | grep "^memberNisNetgroup" | awk '{print $NF}' | egrep -v "$filter"`"
+                  fi
+               fi
+            done
+
+            # if no new nestings were found then we're done and we can exit the loop with the results
+            if [[ -z $nested ]]; then
+               bottom=found
+            fi
+         done
+
+         # Now find the members of each netgroup that is a nested member of this one
+         unset nmembers 
+
+         # Look at all of the netgroups we found in the recursion and get all of the members of them
+         for nng in $ngfound; do
+            if [[ -z $nmembers ]]; then
+               #nmembers=`$LDAP_SEARCH -b $NG_BASE "(cn=${nng})" 2>&1 | egrep -v '^#|^$|^search|^result' | grep ^nisNetgroupTriple | awk -F',' '{print $2}'`
+               nmembers=`$LDAP_SEARCH -b $NG_BASE "(cn=${nng})" 2>&1 | egrep -v '^#|^$|^search|^result' | grep ^nisNetgroupTriple | sed 's/^nisNetgroupTriple: //g; s/(,//g; s/(-,//g; s/(//g; s/,,)//g; s/,-,)//g; s/,)//g'`
+            else
+               #nmembers="$nmembers `$LDAP_SEARCH -b $NG_BASE "(cn=${nng})" 2>&1 | egrep -v '^#|^$|^search|^result' | grep ^nisNetgroupTriple | awk -F',' '{print $2}'`"
+               nmembers="$nmembers `$LDAP_SEARCH -b $NG_BASE "(cn=${nng})" 2>&1 | egrep -v '^#|^$|^search|^result' | grep ^nisNetgroupTriple | sed 's/^nisNetgroupTriple: //g; s/(,//g; s/(-,//g; s/(//g; s/,,)//g; s/,-,)//g; s/,)//g'`"
+            fi
+         done
+
+         # Sort the output and remove any duplicates
+         allmembers=`echo $members $nmembers | sort -u`
+
+         # Make sure we actually have some results before doing all this work
+         if [[ -n $allmembers ]]; then 
+
+            # If there's a 1 after the option, print everything in a single column
+            if [[ "$MODE" == "-N1" ]]; then
+               for member in $allmembers; do echo $member; done
+            else
+               for member in $allmembers; do echo $member; done | sed ':a;N;$!ba;s/\n/ /g'
+            fi
+         fi
+         
+
+      else
+         echo "Netgroup \"$SS\" not found."
+      fi
+
+   elif [[ "$MODE" == "-u" ]] || [[ "$MODE" == "-u1" ]]; then
+      # List all netgroups for a given user
+
+      unset memberof
+      for ng in `$LDAP_SEARCH -b $NG_BASE "(&(objectclass=nisnetgroup)(nisNetgroupTriple=\(-,$SS,\)))" cn | grep ^cn: | sed 's/^cn:[ \t]//'`; do
+         if [[ -z $memberof ]]; then
+            memberof=$ng
+         else
+            memberof="$memberof $ng"
+         fi
+      done
+      if [[ -n $memberof ]]; then 
+         if [[ "$MODE" == "-u1" ]]; then
+            for mon in $memberof; do echo $mon; done
+         else
+            for mon in $memberof; do echo $mon; done | sed ':a;N;$!ba;s/\n/ /g'
+         fi
+      else
+         echo "User \"$SS\" is not a member of any netgroups."
+      fi
+
+   elif [[ "$MODE" == "-h" ]] || [[ "$MODE" == "-h1" ]]; then
+
+      unset memberof
+      for ng in `$LDAP_SEARCH -b $NG_BASE "(&(objectclass=nisnetgroup)(nisNetgroupTriple=\($SS,-,\)))" cn | grep ^cn: | sed 's/^cn:[ \t]//'`; do
+         if [[ -z $memberof ]]; then
+            memberof=$ng
+         else
+            memberof="$memberof $ng"
+         fi
+      done
+      if [[ -n $memberof ]]; then
+         if [[ "$MODE" == "-u1" ]]; then
+            for mon in $memberof; do echo $mon; done
+         else
+            for mon in $memberof; do echo $mon; done | sed ':a;N;$!ba;s/\n/ /g'
+         fi
+      else
+         echo "Host \"$SS\" is not a member of any netgroups."
+      fi
+
+   elif [[ "$MODE" == "-U" ]] || [[ "$MODE" == "-U1" ]]; then
+      # List all netgroups for a given user, include membership via nested netgroups
+
+      # Find all netgroups the user is a direct member of
+      unset memberof
+      for ng in `$LDAP_SEARCH -b $NG_BASE "(&(objectclass=nisnetgroup)(nisNetgroupTriple=\(-,$SS,\)))" cn | grep ^cn: | sed 's/^cn:[ \t]//'`; do
+         if [[ -z $memberof ]]; then
+            memberof=$ng
+         else
+            memberof="$memberof $ng"
+         fi
+      done
+
+      
+      if [[ -z $memberof ]]; then
+         echo "User \"$SS\" is not a member of any netgroups."
+      else
+
+         # Crawl the list of netgroups and find all nested members
+         ngfound=$memberof
+
+         # We'll use this variable to indicate when we have reached the end of the nesting
+         unset bottom
+         
+         while [[ -z $bottom ]]; do
+            
+            # Add the results of the last check "nested" to the total list of netgroups
+            ngfound="$ngfound $nested"
+
+            #create a filter with the name of each known netgroup so we do not add any to the list that already exist
+            unset filter
+            for mng1 in $ngfound; do
+               if [[ -z $filter ]]; then
+                  filter="${mng1}$"
+               else
+                  filter="${filter}|${mng1}$"
+               fi
+            done
+
+            #search each known netgroup for nested membership, but exclude the ones we already know about with the filter
+            unset nested
+            for mng2 in $ngfound; do
+
+               #if any netgroups are a member of this one...
+               if [[ -z $nested ]];then
+                  nested=`$LDAP_SEARCH -b $NG_BASE "(memberNisNetgroup=${mng2})" cn | grep ^cn: | awk '{print $NF}' | egrep -v "$filter"`
+               else
+                  nested="$nested `$LDAP_SEARCH -b $NG_BASE "(memberNisNetgroup=${mng2})" cn | grep ^cn: | awk '{print $NF}' | egrep -v "$filter"`"
+               fi
+
+            done
+            # if no new nestings were found then we're done and we can exit the loop with the results
+            if [[ -z $nested ]]; then
+               bottom=found
+            fi
+
+         done
+
+         if [[ -n $ngfound ]]; then 
+            if [[ "$MODE" == "-U1" ]]; then
+               for mon in $ngfound; do echo $mon | egrep -v '_hosts$'; done | sort -u
+            else
+               for mon in $ngfound; do echo $mon | egrep -v '_hosts$'; done | sort -u | sed ':a;N;$!ba;s/\n/ /g'
+            fi
+         fi
+      fi
+
+   elif [[ "$MODE" == "-H" ]] || [[ "$MODE" == "-H1" ]]; then
+      # List all netgroups for a given host, include membership via nested netgroups
+      unset memberof
+      for ng in `$LDAP_SEARCH -b $NG_BASE "(&(objectclass=nisnetgroup)(nisNetgroupTriple=\($SS,-,\)))" cn | grep ^cn: | sed 's/^cn:[ \t]//'`; do
+         if [[ -z $memberof ]]; then
+            memberof=$ng
+         else
+            memberof="$memberof $ng"
+         fi
+      done
+      if [[ -z $memberof ]]; then
+         echo "Host \"$SS\" is not a member of any netgroups."
+      else
+
+         # Crawl the list of netgroups and find all nested members
+         ngfound=$memberof
+
+         # We'll use this variable to indicate when we have reached the end of the nesting
+         unset bottom
+         
+         while [[ -z $bottom ]]; do
+            
+            # Add the results of the last check "nested" to the total list of netgroups
+            ngfound="$ngfound $nested"
+
+            #create a filter with the name of each known netgroup so we do not add any to the list that already exist
+            unset filter
+            for mng1 in $ngfound; do
+               if [[ -z $filter ]]; then
+                  filter="${mng1}$"
+               else
+                  filter="${filter}|${mng1}$"
+               fi
+            done
+
+            #search each known netgroup for nested membership, but exclude the ones we already know about with the filter
+            unset nested
+            for mng2 in $ngfound; do
+               
+               #if any netgroups are a member of this one...
+               if [[ -z $nested ]];then
+                  nested=`$LDAP_SEARCH -b $NG_BASE "(memberNisNetgroup=${mng2})" cn | grep ^cn: | awk '{print $NF}' | egrep -v "$filter"`
+               else
+                  nested="$nested `$LDAP_SEARCH -b $NG_BASE "(memberNisNetgroup=${mng2})" cn | grep ^cn: | awk '{print $NF}' | egrep -v "$filter"`"
+               fi
+            done
+            # if no new nestings were found then we're done and we can exit the loop with the results
+            if [[ -z $nested ]]; then
+               bottom=found
+            fi
+         done
+
+         if [[ -n $ngfound ]]; then 
+            if [[ "$MODE" == "-H1" ]]; then
+               for mon in $ngfound; do echo $mon | egrep -v '_users$'; done | sort -u
+            else
+               for mon in $ngfound; do echo $mon | egrep -v '_users$'; done | sort -u | sed ':a;N;$!ba;s/\n/ /g'
+            fi
+         fi
+      fi
+
+   elif [[ "$MODE" == "-m" ]] || [[ "$MODE" == "-m1" ]]; then
+      # List all netgroups that are a member of this one
+
+
+      # Get a list of netgroups with this one as a member
+      ngmembers=`$LDAP_SEARCH -b $NG_BASE "(cn=$SS)" membernisnetgroup | grep ^membernisnetgroup: | sed 's/^membernisnetgroup:[ \t]//'`
+
+      if [[ -n $ngmembers ]]; then 
+         if [[ "$MODE" == "-m1" ]]; then
+            for ngm in $ngmembers; do echo $ngm; done | sort -u
+         else
+            for ngm in $ngmembers; do echo $ngm; done | sort -u | sed ':a;N;$!ba;s/\n/ /g'
+         fi
+      #else
+         #echo "\"$SS\" does not have any member netgroups."
+      fi
+
+   elif [[ "$MODE" == "-M" ]] || [[ "$MODE" == "-M1" ]]; then
+      # List all netgroups that have this one as a member
+
+      # Make sure the netgroup actually exists
+
+      ngshasmember=`$LDAP_SEARCH -b $NG_BASE "(&(objectclass=nisnetgroup)(memberNisNetgroup=$SS))" cn | grep ^cn: | sed 's/^cn: //g'`
+
+      if [[ -n $ngshasmember ]]; then
+         if [[ "$MODE" == "-M1" ]]; then
+            for nghm in $ngshasmember; do echo $nghm; done
+         else
+            for nghm in $ngshasmember; do echo $nghm; done | sed ':a;N;$!ba;s/\n/ /g'
+         fi
+
+      #else
+         #echo "Netgroup \"$SS\" is not a member of any other netgroups."
+      fi
+
+   else
+      f_Usage
+      exit
+   fi
+else
+   f_Usage
+   
+fi
+
+

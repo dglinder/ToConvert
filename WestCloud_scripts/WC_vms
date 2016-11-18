@@ -1,0 +1,79 @@
+#############################################
+# Purpose: Define hosts for WestCloud template production
+# Author: DGL
+# Revision: $Rev$
+# Updated by: $Author$
+# Last change date: $LastChangedDate$
+# SVN URL: $HeadURL$
+# To export the latest version of this file:
+#   svn export [HeadURL]
+#############################################
+
+[local]
+localhost
+
+[templates]
+# RHEL5 should be 10.70.99.179
+test-rhel5-cloud-template	ansible_host=10.70.96.203
+# RHEL5 should be 10.70.99.180
+test-rhel6-cloud-template	ansible_host=10.70.96.200
+
+[all_templates:children]
+prod_templates
+test_templates
+
+[prod_templates]
+eit-rhel6-cloud-template	ansible_host=10.70.96.200
+eit-rhel5-cloud-template	ansible_host=10.70.96.203
+
+[den06_templates]
+eit-rhel6-cloud-template	ansible_host=10.70.96.200
+eit-rhel5-cloud-template	ansible_host=10.70.96.203
+
+[test_templates]
+# RHEL5 should be 10.70.99.179
+test-rhel5-cloud-template	ansible_host=10.70.96.203
+# RHEL5 should be 10.70.99.180
+test-rhel6-cloud-template	ansible_host=10.70.96.200
+#led31567			ansible_host=10.70.109.157
+#led31018			ansible_host=led31018
+#led31019			ansible_host=led31019
+#led31489
+#led31490
+
+
+#
+# Testing
+#  sudo ansible sys_group_a -i ~/WestCloud_scripts/WC_vms -m ping
+#
+
+[sys_group_a:children]
+# Visible to - Ops, InfoSec, AuditA, AppAdminA
+team_a
+shared_sys
+
+[sys_group_b:children]
+# Visible to - Ops, InfoSec, AuditB, AppAdminB
+team_b
+shared_sys
+
+[team_a]
+# Visible to - Ops, InfoSec, AuditA, AppAdminA
+LED90001			ansible_host=led31018
+LED99999			ansible_host=led31018
+
+[team_b]
+# Visible to - Ops, InfoSec, AuditB, AppAdminB
+LED90101			ansible_host=led31018
+LED99999			ansible_host=led31018
+
+[shared_sys]
+# Visible to - Ops, InfoSec, AppAdminA&B, AuditA&B
+LED90002			ansible_host=led31018
+LED90102			ansible_host=led31018
+LED99999			ansible_host=led31018
+
+[info_sec]
+# Not visible to anyone but the “Ops” and “InfoSec” groups (through “all”)
+LED90010			ansible_host=led31018
+LED90011			ansible_host=led31018

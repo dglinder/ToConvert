@@ -1,0 +1,96 @@
+###ROLE NAME ##########################################
+# ROLE_NAME should be short, but descriptive enough to explain
+# its function.
+#
+# example:
+#    ROLE_NAME: WebAdmin_role
+#
+# Note: the _role suffix will be added to the role name
+#       automatically whether you specify it in this file
+#       or not.
+#######################################################
+#ROLE_NAME:
+
+##USERS##############################################
+# You may specify as many USER lines as you like
+# USER must refer to a user netgroup, not an individual user
+# Use a separate line for each user netgroup
+#
+# example:
+#    USER: UnixAdmin_users
+#    USER: StorageAdmin_users
+#####################################################
+#USER:
+
+##HOSTS##############################################
+# You may specify as many HOST lines as you like
+# HOST must be the name of a host or machine netgroup
+# Use a separate line for each HOST
+# You may use the keyword ALL to specify that this
+# role may be used anywhere.
+#
+# example 1:
+#    HOST: Test_hosts
+#
+# example 2: 
+#    HOST: ALL
+#####################################################
+#HOST:
+
+##COMMANDS###########################################
+# You may specify as many COMMAND lines as you like
+# Use a separate line for each individual command
+# Remember to use full paths for commands
+# You may use the keyword ALL to specify that
+# this role will enable the user to execute any command.
+# The ALL keyword should be used sparingly as it effectively
+# gives complete root access via the role.
+# 
+# You may also deny specific commands by prefixing them
+# with the ! operator - there must be no space between the
+# ! and the command. This is most useful in conjunction with
+# the ALL keyword.
+#
+# example 1: 
+#    COMMAND: /usr/bin/whoami 
+#    COMMAND: /etc/init.d/nscd re* 
+#
+# example 2: 
+#    COMMAND: ALL 
+#
+# example 3: 
+#    COMMAND: ALL 
+#    COMMAND: !/bin/su -
+#    COMMAND: !/bin/su - root
+#####################################################
+#COMMAND:
+
+##REQUIRE PASSWORD###################################
+# Should the user be asked for a password when
+# executing the commands in this role with sudo?
+# Options are YES or NO
+# Default is YES
+#####################################################
+ASKPASSWORD: YES
+
+##SUDO OPTION########################################
+# Apply generic sudo options
+# Each option must be specified on its own line
+# Recommended options:
+#    Use the "NOEXEC" option when giving the ALL command
+#    to prevent dynamic linking.  This will prevent users
+#    from simply writing a script to get around restrictions
+#    that deny specific actions such as "su -".
+#    With this option turned on, scripts must be run as
+#    the user with sudo used inline.
+#####################################################
+#OPTION: 
+
+##ROLE DESCRIPTION###################################
+# Please provide a brief one-line description of this
+# role. Consider including both the purpose and the
+# teams that are supposed to use it.  Description is
+# optional, but strongly recommended
+#####################################################
+#DESCRIPTION: 
+

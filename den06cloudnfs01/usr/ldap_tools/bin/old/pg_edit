@@ -1,0 +1,399 @@
+#!/bin/bash
+
+###########################################
+# Purpose: Edit a POSIX Group in LDAP
+# Author: SDW
+# Incept 09/12/2012
+
+# Notes: - basic LDAP authentication must already be configured and working
+#          on the server where this script is run from
+
+f_Usage () {
+   echo "$0 USAGE"
+   echo ""
+   echo "$0 <POSIX group name>"
+   echo ""
+   echo "   Opens a POSIX group up for editing. If a group name is not"
+   echo "   speified on the command line, you will be prompted to provide"
+   echo "   one."
+   echo ""
+   echo "   Note: POSIX groups cannot be re-named. You will need to create"
+   echo "   a new group with the desired name and delete the old one."
+   echo ""
+}
+
+
+# Set path to the location of the script no matter how it was invoked
+if [[ `echo $0 | sed 's/^.\///g'` == `basename $0` ]]; then
+   WORKDIR=`pwd`
+else
+   BASENAME=`basename $0`
+   WORKDIR=`echo $0 | sed 's/'"$BASENAME"'$//g'`
+fi
+
+cd $WORKDIR
+
+# Set some basic options for ldap searching, durrently the directory server doesn't require a binddn or a rootbinddn
+# so simple authentication should work fine
+LDAP_SEARCH="/usr/bin/ldapsearch -x -ZZ"
+UPDATE_USER=`ldapsearch -x -ZZ "(uid=$USER)" dn | grep ^dn: | sed 's/^dn:[ \t]//'`
+LDAP_MODIFY="/usr/bin/ldapmodify -x -ZZ -D \"$UPDATE_USER\""
+LDAP_BT="$LDAP_SEARCH '(ou=SUDOers)' -D \"$UPDATE_USER\" -w"
+MAXTRIES=5
+
+# Temp file to hold any ldif that we might need to push to the directory
+LDIF_TMP=/eit/admin/scripts/ldap_tools/tmp/.`basename $0`.$$.ldt
+LDIF_IN_TMP=/tmp/$$.pgel.$$.ldt
+EDITFILE=/tmp/$$.pgef
+BACKUP_DIR=/eit/admin/scripts/ldap_tools/local_backup
+TS=`date +%Y%m%d%H%M%S`
+
+
+# find the ldap base
+if [[ -s /etc/ldap.conf ]]; then
+   LDC=/etc/ldap.conf
+elif [[ -s /etc/openldap/ldap.conf ]]; then
+   LDC=/etc/openldap/ldap.conf
+fi
+LDAP_BASE=`egrep -i "^base[ \t]" $LDC | sed 's/^base[ \t]//i'`
+
+if [[ -z $LDAP_BASE ]]; then 
+   echo "Unable to find the base dn for LDAP - please make sure ldap is properly"
+   echo "configured on this machine.  If it IS properly configured and you're"
+   echo "still getting this error, you probably need to update the LDAP_SEARCH"
+   echo "variable in this script to something that works with the current config."
+   exit
+fi
+
+if [[ -z $UPDATE_USER ]]; then
+   echo "Unable to locate the correct DN for your user account [$USER]."
+   echo "You must be a member of the domain in order to use this script."
+   exit
+fi
+
+
+
+# Get information from the user
+
+PGTBE=$1
+
+# If we got a name from the command line
+if [[ -n $PGTBE ]]; then
+
+   if [[ "$PGTBE" == "--help" ]]; then
+      f_Usage
+      exit
+   fi
+
+   # Verify the POSIX group exists
+   if [[ -z `$LDAP_SEARCH -b $LDAP_BASE "(&(objectClass=posixgroup)(cn=${PGTBE}))" cn | grep ^cn:` ]]; then
+      echo "ERROR: POSIX group \"$PGTBE\" not found in the directory."
+      exit
+   else
+      PGTBEDN=`$LDAP_SEARCH -b $LDAP_BASE "(&(objectClass=posixgroup)(cn=${PGTBE}))" dn | sed ':a;N;$!ba;s/\n //g' | grep $PGTBE | grep ^dn: | sed 's/^dn: //g'`
+   fi
+
+# If we did NOT get a name from the command line 
+else 
+
+   # Prompt the user for a name
+   VC2=FALSE
+   while [[ $VC2 == FALSE ]]; do
+      unset GPGTBE
+      read -p "What is the name of the POSIX to be edited?: " GPGTBE
+
+      # Check for non-existence - retry on error
+      if [[ -z `$LDAP_SEARCH -b $LDAP_BASE "(&(objectClass=posixgroup)(cn=${GPGTBE}))" cn | grep ^cn:` ]]; then
+         echo "ERROR: POSIX group \"$GPGTBE\" not found in the directory."
+         read -p "Press Enter to try a different name, Ctrl+C to cancel." JUNK
+         tput cuu1; tput el; tput cuu1; tput el; tput cuu1; tput el
+      else
+         VC2=TRUE
+         PGTBE=$GPGTBE
+         PGTBEDN=`$LDAP_SEARCH -b $LDAP_BASE "(&(objectClass=posixgroup)(cn=${PGTBE}))" dn | sed ':a;N;$!ba;s/\n //g' | grep $PGTBE | grep ^dn: | sed 's/^dn: //g'`
+      fi
+   done
+fi
+
+# Output the user's ldap entry to a temp file
+
+#$LDAP_SEARCH -b $LDAP_BASE "(&(objectClass=posixgroup)(cn=${PGTBE}))" | egrep -v '^#|^$|^search|^result' | sed ':a;N;$!ba;s/\n //g'> $LDIF_IN_TMP
+$LDAP_SEARCH -b "$PGTBEDN" | egrep -v '^#|^$|^search|^result' | sed ':a;N;$!ba;s/\n //g'> $LDIF_IN_TMP
+
+# Start the edit file
+
+echo "#### POSIX GROUP NAME ################" > $EDITFILE
+echo "# DO NOT CHANGE POSIX GROUP NAME" >> $EDITFILE
+echo "######################################" >> $EDITFILE
+echo "PG_NAME: $PGTBE" >> $EDITFILE
+echo "" >> $EDITFILE
+
+# Editable attributes are:
+# gidNumber
+# uniqueMember
+
+#Mandatory
+echo "#### NUMERIC GID ################################" >> $EDITFILE
+echo "# Duplicate GIDs are allowed, but use with care" >> $EDITFILE
+echo "# When changing a GID remember to update users with" >> $EDITFILE
+echo "#    this group as a primary GID" >> $EDITFILE
+echo "#####################################i############" >> $EDITFILE
+if [[ -n `grep -i '^gidNumber:' $LDIF_IN_TMP` ]]; then
+   grep -i '^gidNumber:' $LDIF_IN_TMP | sed 's/^gidNumber:/UNIX_GID:/gI' >> $EDITFILE
+else
+   echo "UNIX_GID: " >> $EDITFILE
+fi
+echo "" >> $EDITFILE
+
+#Optional
+echo "#### GROUP MEMBERS ###############################" >> $EDITFILE
+echo "# Group Members are Optional" >> $EDITFILE
+echo "# Each member must be specified on a separate line" >> $EDITFILE
+echo "#####################################i############" >> $EDITFILE
+if [[ -n `grep -i '^uniqueMember:' $LDIF_IN_TMP` ]]; then
+   grep -i '^uniqueMember:' $LDIF_IN_TMP | awk -F',' '{print $1}' | sed 's/^uniqueMember:/MEMBER:/gI; s/uid=//g' >> $EDITFILE
+else
+   echo "MEMBER: " >> $EDITFILE
+fi
+echo "" >> $EDITFILE
+
+echo "#### DESCRIPTION #################################" >> $EDITFILE
+echo "# Description is Optional" >> $EDITFILE
+echo "# Description can contain any printing character but" >> $EDITFILE
+echo "#    must be a single line." >> $EDITFILE
+echo "#####################################i############" >> $EDITFILE
+DSTRING=`grep -i "^description:" $LDIF_IN_TMP`
+if [[ -n `echo $DSTRING | grep -i "^description::"` ]]; then
+    BASE64DESC=`echo $DSTRING | grep -i "^description::" | sed 's/^description:://i'`
+    DESC=`echo $BASE64DESC | perl -MMIME::Base64 -0777 -ne 'print decode_base64($_)'`
+    echo "DESCRIPTION: $DESC" >> $EDITFILE
+elif [[ -n `echo $DSTRING | grep -i "^description:"` ]]; then
+    DESC=`echo $DSTRING | grep -i "^description:" | sed 's/^description://i'`
+    echo "DESCRIPTION: $DESC" >> $EDITFILE
+else
+    echo "DESCRIPTION: " >> $EDITFILE
+fi
+
+
+
+# The editable update file has been built, now we need to record the md5sum
+# so we can tell if it was changed.
+
+BEFORE_MD5=`md5sum $EDITFILE | awk '{print $1}'`
+
+# keep editing the file until the user quits or verification passes
+VERIFIED=FALSE
+while [[ $VERIFIED == FALSE ]]; do
+
+
+   vim $EDITFILE
+
+   # Next, check the file for updates
+
+   AFTER_MD5=`md5sum $EDITFILE | awk '{print $1}'`
+
+   if [[ "$AFTER_MD5" == "$BEFORE_MD5" ]]; then
+      echo "No changes made - nothing to update."
+      /bin/rm $EDITFILE
+      /bin/rm $LDIF_IN_TMP
+      exit
+   fi
+
+   # If updates were found, then check them
+
+
+   echo ""
+   echo "Checking the edited file for errors..."
+   echo ""
+   
+
+   # Start with the assumption that everything checks out.  Any one
+   # Failure will change this value
+   FAILURE=NO
+
+   # Check name
+   echo "Checking Name"
+   PGN=`grep "^PG_NAME:" $EDITFILE | sed 's/^PG_NAME: //; s/^PG_NAME://'`
+   if [[ $PGN != $PGTBE ]]; then
+      echo "Error: PG_NAME does not match the POSIX group being edited!"
+      FAILURE=YES
+   fi
+  
+   # Check gidNumber - make sure it's there
+   if [[ -z `grep "^UNIX_GID:" $EDITFILE | sed 's/^UNIX_GID: //g; s/^UNIX_GID://g'` ]]; then
+      echo "Error: UNIX_GID is a required attribute"
+      FAILURE=YES
+   else
+      OGIDNUM=`grep "^UNIX_GID:" $EDITFILE | sed 's/^UNIX_GID: //g; s/^UNIX_GID://g'`
+   fi
+
+   # description and uniqueMember are optional but unique member has to be validated
+
+   if [[ -n `grep "^MEMBER:" $EDITFILE | sed 's/^MEMBER://g'` ]]; then
+      unset OMDNS
+      for OM in `grep "^MEMBER:" $EDITFILE | sed 's/^MEMBER://g'`; do
+         #Make sure the user exists, and get his/her DN
+         unset OMDN
+         OMDN=`$LDAP_SEARCH -b $LDAP_BASE "(uid=$OM)" dn | grep "^dn:" | sed 's/dn://g'`
+         if [[ -z $OMDN ]]; then
+            echo "Error: the user \"${OM}\" was not found in the directory."
+            FAILURE=YES
+         else
+            OMS="${OMS}:${OM}"
+            OMDNS="${OMDNS}:${OMDN}"
+         fi
+      done
+   fi
+
+   ODESC=`grep "^DESCRIPTION:" $EDITFILE | sed 's/^DESCRIPTION: //g; s/^DESCRIPTION://g'`   
+
+   # Check for duplicate lines - LDAP ADD will fail even on arbitrary fields
+   # If the same value is specified more than once for any attribute
+   if [[ -n `cat $EDITFILE | uniq -d` ]]; then
+      echo "Error: duplicate instances of the following line detected"
+      cat $EDITFILE | uniq -d | sed 's/^/       /g'
+      FAILURE=YES
+   fi
+
+
+
+   # Now, check to see if we failed at any point
+   if [[ $FAILURE == YES ]]; then
+      echo ""
+      echo "Unable to apply the changes because of the errors above."
+      read -p "Enter \"e\" to edit the file, anything else to quit: " ERRORCHOICE
+      if [[ "$ERRORCHOICE" != "e" ]] && [[ "$ERRORCHOICE" != "E" ]]; then
+         /bin/rm $EDITFILE
+         exit
+      fi
+   else
+      VERIFIED=TRUE
+   fi
+
+
+done
+
+echo "Verification passed.  Applying update."
+
+# Build our LDIF based on the new information, we'll be replacing the values
+# with whatever was read in from the edited file
+
+if [[ -f $LDIF_TMP ]]; then
+   /bin/rm $LDIF_TMP
+fi
+
+# Specify the DN of the posix group to be edited and specify that we're modifying it
+echo "dn: $PGTBEDN" > $LDIF_TMP
+echo "changetype: modify" >> $LDIF_TMP
+
+# Make sure this is a posix group - it's possible that it isn't yet.
+
+if [[ -z `grep -i ^objectClass: $LDIF_IN_TMP | grep -i posixGroup` ]]; then
+   echo "add: objectClass" >> $LDIF_TMP
+   echo "objectClass: posixGroup" >> $LDIF_TMP
+   echo "-" >> $LDIF_TMP
+fi
+
+# Required fields - we still have to test if they exist because
+# the account may not have been a posix account to start with.
+
+# UNIX_GID
+if [[ -n `grep -i ^gidNumber:  $LDIF_IN_TMP` ]]; then
+   echo "replace: gidNumber" >> $LDIF_TMP
+else
+   echo "add: gidNumber" >> $LDIF_TMP
+fi
+echo "gidNumber: $OGIDNUM" >> $LDIF_TMP
+echo "-" >> $LDIF_TMP
+
+
+#Optional stuff
+
+
+# MEMBERS
+if [[ -n `grep -i ^uniqueMember:  $LDIF_IN_TMP` ]]; then
+   echo "delete: uniqueMember" >> $LDIF_TMP
+   echo "-" >> $LDIF_TMP
+fi
+if [[ -n `grep -i ^memberUid: $LDIF_IN_TMP` ]]; then
+   echo "delete: memberUid" >> $LDIF_TMP
+   echo "-" >> $LDIF_TMP
+fi
+if [[ -n $OMDNS ]]; then
+   echo "add: uniqueMember" >> $LDIF_TMP
+   echo $OMDNS | sed 's/:/\nuniqueMember:/g' | grep -v "^$" >> $LDIF_TMP
+   echo "-" >> $LDIF_TMP
+   echo "add: memberUid" >> $LDIF_TMP
+   echo $OMS | sed 's/:/\nmemberUid:/g' | grep -v "^$" >> $LDIF_TMP
+   echo "-" >> $LDIF_TMP
+fi
+
+
+
+# DESCRIPTION
+if [[ -n `grep -i ^description:  $LDIF_IN_TMP` ]]; then
+   echo "delete: description" >> $LDIF_TMP
+   echo "-" >> $LDIF_TMP
+fi
+if [[ -n $ODESC ]]; then
+   echo "add: description" >> $LDIF_TMP
+   echo "description: $ODESC" >> $LDIF_TMP
+   echo "-" >> $LDIF_TMP
+fi
+
+# Make a backup of the object
+if [[ ! -d $BACKUP_DIR ]]; then
+   mkdir -p $BACKUP_DIR
+fi
+LDIF_BAK=${BACKUP_DIR}/pg_edited_${PGTBE}_${TS}.ldif
+
+echo "## Script Name: $0" > $LDIF_BAK
+echo "## Executed By/From: `/usr/bin/who -m`" >> $LDIF_BAK
+echo "##" >> $LDIF_BAK
+echo "## Object Before Modification:" >> $LDIF_BAK
+
+# Back up the object
+$LDAP_SEARCH -b $PG_BASE "(cn=${PGTBE}" 2>&1 | egrep -v '^#|^$|^search|^result' >> $LDIF_BAK
+
+if [[ ! -s $LDIF_BAK ]]; then
+   echo "Error: there was a problem creating the backup file for $PGTBE"
+   exit
+fi
+
+echo "## Attempted Modification:" >> $LDIF_BAK
+echo "##" >> $LDIF_BAK
+cat $LDIF_TMP | sed 's/^/#/g' >> $LDIF_BAK
+
+
+
+# Verify LDAP password
+VP=FALSE
+TRIES=0
+while [[ $VP == FALSE ]] && [[ $TRIES -le $MAXTRIES ]]; do
+   read -sp "LDAP Password ($UPDATE_USER): " UUP
+   echo "$LDAP_BT \"$UUP\"" | /bin/bash 2>&1 >/dev/null
+   if [[ $? != 0 ]]; then
+      unset UUP
+      let TRIES=$TRIES+1
+   else
+      echo ""
+      VP=TRUE
+   fi
+done
+
+
+echo "$LDAP_MODIFY -w \"$UUP\" -a -f $LDIF_TMP " | /bin/bash
+if [[ $? != 0 ]]; then
+   echo "There was an error adding the object(s)"
+   echo "The command that failed was:"
+   echo "   $LDAP_MODIFY -W -a -f $LDIF_TMP"
+   echo ""
+   echo "## Update failed" >> $LDIF_BAK
+   exit
+fi
+
+echo "## Update succeeded" >> $LDIF_BAK
+/bin/rm $LDIF_TMP
+
+exit
+

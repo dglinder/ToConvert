@@ -1,0 +1,2 @@
+#!/bin/bash
+/bin/rm /eit/admin/scripts/ldap_tools/tmp/*.$$.ldt

@@ -1,0 +1,11 @@
+#!/bin/bash
+
+# This creates the initial DNS configuration during kickstart
+# Do not use this on an up-and-running system
+
+RESOLV=/etc/resolv.conf
+
+echo "search wic.west.com icallinc.com" > $RESOLV
+echo "nameserver 10.0.35.210" >> $RESOLV
+echo "nameserver 10.0.0.210" >> $RESOLV
+echo "nameserver 10.17.126.43" >> $RESOLV

@@ -1,0 +1,214 @@
+#!/bin/bash
+
+###########################################
+# Purpose: Create a POSIX Group in LDAP
+# Author: SDW
+# Incept 09/25/2012
+
+# Notes: - basic LDAP authentication must already be configured and working
+#          on the server where this script is run from
+
+f_Usage () {
+   echo "$0 USAGE"
+   echo ""
+   echo "$0" 
+   echo ""
+   echo "  Interactively creates a new POSIX group in the directory."
+   echo ""
+}
+
+
+# Set path to the location of the script no matter how it was invoked
+if [[ `echo $0 | sed 's/^.\///g'` == `basename $0` ]]; then
+   WORKDIR=`pwd`
+else
+   BASENAME=`basename $0`
+   WORKDIR=`echo $0 | sed 's/'"$BASENAME"'$//g'`
+fi
+
+cd $WORKDIR
+
+# Set some basic options for ldap searching, durrently the directory server doesn't require a binddn or a rootbinddn
+# so simple authentication should work fine
+LDAP_SEARCH="/usr/bin/ldapsearch -x -ZZ"
+UPDATE_USER=`ldapsearch -x -ZZ "(uid=$USER)" dn | grep ^dn: | sed 's/^dn:[ \t]//'`
+LDAP_MODIFY="/usr/bin/ldapmodify -x -ZZ -D \"$UPDATE_USER\""
+LDAP_BT="$LDAP_SEARCH '(ou=SUDOers)' -D \"$UPDATE_USER\" -w"
+MAXTRIES=5
+BACKUP_DIR=/eit/admin/scripts/ldap_tools/local_backup
+TS=`date +%Y%m%d%H%M%S`
+
+
+# Temp file to hold any ldif that we might need to push to the directory
+LDIF_TMP=/eit/admin/scripts/ldap_tools/tmp/.`basename $0`.$$.ldt
+
+
+# find the ldap base
+if [[ -s /etc/ldap.conf ]]; then
+   LDC=/etc/ldap.conf
+elif [[ -s /etc/openldap/ldap.conf ]]; then
+   LDC=/etc/openldap/ldap.conf
+fi
+LDAP_BASE=`egrep -i "^base[ \t]" $LDC | sed 's/^base[ \t]//i'`
+
+if [[ -z $LDAP_BASE ]]; then 
+   echo "Unable to find the base dn for LDAP - please make sure ldap is properly"
+   echo "configured on this machine.  If it IS properly configured and you're"
+   echo "still getting this error, you probably need to update the LDAP_SEARCH"
+   echo "variable in this script to something that works with the current config."
+   exit
+fi
+
+if [[ -z $UPDATE_USER ]]; then
+   echo "Unable to locate the correct DN for your user account [$USER]."
+   echo "You must be a member of the domain in order to use this script."
+   exit
+fi
+
+if [[ "$1" == "--help" ]]; then
+   f_Usage
+   exit
+fi
+# For auto-generation of GID
+
+START_GID=40001
+MAX_GID=99998
+
+# Find next available GID:
+unset NEXT_AVAILABLE
+CHECK=$START_GID
+while [[ -z $NEXT_AVAILABLE ]] && [[ $CHECK -lt $MAX_GID ]]; do
+   if [[ -z `$LDAP_SEARCH -b $LDAP_BASE "(&(objectClass=posixgroup)(gidNumber=$CHECK))" dn | grep "^dn:"` ]]; then
+      NEXT_AVAILABLE=$CHECK
+   else
+      let CHECK=$CHECK+1
+   fi
+done
+
+
+
+# Get information from the user
+
+echo "--|[Create A POSIX Group]|--"
+echo ""
+VC1=FALSE
+while [[ $VC1 == FALSE ]]; do
+   read -p "POSIX Group Name: " GPGN
+
+   if [[ -n $GPGN ]]; then
+      SPGN=`echo $GPGN | tr -d '\`!@$%^&*()+=/|[]{}:;"\\'\'''`
+   
+      # Verify the name isn't already in use
+      if [[ -z `$LDAP_SEARCH -b $LDAP_BASE "(&(objectClass=posixgroup)(cn=$SPGN))" cn | grep "^cn:"` ]]; then
+         VC1=TRUE
+      else
+         echo "Error: The POSIX group name \"$SPGN\" is already in use."
+         read -p "Press Enter to try another name, Ctrl+C to quit: " JUNK
+         unset GPGN SPGN
+         tput cuu1; tput el; tput cuu1; tput el; tput cuu1; tput el
+      fi
+   else
+      echo "Error: POSIX group user name is not optional."
+      read -p "Press Enter to try another name, Ctrl+C to quit: " JUNK
+      unset GPGN SPGN
+      tput cuu1; tput el; tput cuu1; tput el; tput cuu1; tput el
+   fi
+
+done
+
+VC2=FALSE
+while [[ $VC2 == FALSE ]]; do
+   read -p "POSIX group numeric GID [$NEXT_AVAILABLE]: " GNGID 
+   if [[ -n $GNGID ]]; then
+      SNGID=`echo $GNGID | tr -dc "[:digit:]"`
+
+   
+      # Verify the gid isn't already in use
+      if [[ -z `$LDAP_SEARCH -b $LDAP_BASE "(&(objectClass=posixgroup)(gidNumber=$SNGID))" cn | grep "^cn:"` ]]; then
+         VC2=TRUE
+      else
+         echo "Warning: The numeric GID \"$SNGID\" is already in use."
+         read -p "Enter \"Y\" to use this GID anyway, anything else to try again" ALLOWDUP
+         if [[ -n `echo $ALLOWDUP | grep -i "^Y"` ]]; then
+            VC2=TRUE
+         else
+            unset GNGID SNGID ALLOWDUP
+            tput cuu1; tput el; tput cuu1; tput el; tput cuu1; tput el
+         fi
+      fi
+   else
+      SNGID=$NEXT_AVAILABLE
+      VC2=TRUE
+   fi
+
+done
+
+read -p "POSIX Group Description (Optional): " GPGDES
+
+SPGDES=$GPGDES
+
+# Create the LDIF
+
+cat << EOF > $LDIF_TMP
+dn: cn=$SPGN,ou=Groups,$LDAP_BASE
+gidNumber: $SNGID
+objectClass: top
+objectClass: groupofuniquenames
+objectClass: posixgroup
+cn: $SPGN
+EOF
+if [[ -n $SPGDES ]]; then
+   echo "description: $SPGDES" >> $LDIF_TMP
+fi
+
+# Write netgrup creation details to the backup logs
+if [[ ! -d $BACKUP_DIR ]]; then
+   mkdir -p $BACKUP_DIR
+fi
+LDIF_BAK=${BACKUP_DIR}/pg_created_${SPGN}_${TS}.ldif
+
+echo "## Script Name: $0" > $LDIF_BAK
+echo "## Executed By/From: `/usr/bin/who -m`" >> $LDIF_BAK
+echo "##" >> $LDIF_BAK
+
+cat $LDIF_TMP >> $LDIF_BAK
+if [[ ! -s $LDIF_BAK ]]; then
+   echo "Error: there was a problem writing the create log for $NNGNAME"
+   exit
+#else
+#   echo "Create log written: $LDIF_BAK"
+fi
+
+
+
+# Verify LDAP password
+VP=FALSE
+TRIES=0
+while [[ $VP == FALSE ]] && [[ $TRIES -le $MAXTRIES ]]; do
+   read -sp "LDAP Password ($UPDATE_USER): " UUP
+   echo "$LDAP_BT \"$UUP\"" | /bin/bash 2>&1 >/dev/null
+   if [[ $? != 0 ]]; then
+      unset UUP
+      let TRIES=$TRIES+1
+   else
+      echo ""
+      VP=TRUE
+   fi
+done
+
+
+echo "$LDAP_MODIFY -w \"$UUP\" -a -f $LDIF_TMP " | /bin/bash
+if [[ $? != 0 ]]; then
+   echo "There was an error adding the object(s)"
+   echo "The command that failed was:"
+   echo "   $LDAP_MODIFY -W -a -f $LDIF_TMP"
+   echo ""
+   echo "## Update failed" >> $LDIF_TMP
+   exit
+fi
+
+echo "## Update succeeded" >> $LDIF_TMP
+/bin/rm $LDIF_TMP
+
+exit
+

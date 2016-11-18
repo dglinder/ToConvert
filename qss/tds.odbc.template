@@ -1,0 +1,4 @@
+[FreeTDS]
+Description = v0.91
+Driver64 = /usr/lib64/libtdsodbc.so.0
+Driver = /usr/lib/libtdsodbc.so.0

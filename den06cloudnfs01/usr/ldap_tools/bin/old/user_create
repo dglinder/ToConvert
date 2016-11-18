@@ -1,0 +1,256 @@
+#!/bin/bash
+
+###########################################
+# Purpose: Create an LDAP User
+# Author: SDW
+# Incept 09/12/2012
+
+# Notes: - basic LDAP authentication must already be configured and working
+#          on the server where this script is run from
+f_Usage () {
+   echo "$0 USAGE"
+   echo ""
+   echo "$0"
+   echo ""
+   echo "  Interactively creates a new user account in the directory."
+   echo ""
+}
+
+
+# Set path to the location of the script no matter how it was invoked
+if [[ `echo $0 | sed 's/^.\///g'` == `basename $0` ]]; then
+   WORKDIR=`pwd`
+else
+   BASENAME=`basename $0`
+   WORKDIR=`echo $0 | sed 's/'"$BASENAME"'$//g'`
+fi
+
+cd $WORKDIR
+
+# Set some basic options for ldap searching, durrently the directory server doesn't require a binddn or a rootbinddn
+# so simple authentication should work fine
+LDAP_SEARCH="/usr/bin/ldapsearch -x -ZZ"
+UPDATE_USER=`ldapsearch -x -ZZ "(uid=$USER)" dn | grep ^dn: | sed 's/^dn:[ \t]//'`
+LDAP_MODIFY="/usr/bin/ldapmodify -x -ZZ -D \"$UPDATE_USER\""
+LDAP_BT="$LDAP_SEARCH '(ou=SUDOers)' -D \"$UPDATE_USER\" -w"
+MAXTRIES=5
+BACKUP_DIR=/eit/admin/scripts/ldap_tools/local_backup
+TS=`date +%Y%m%d%H%M%S`
+
+
+# Temp file to hold any ldif that we might need to push to the directory
+LDIF_TMP=/eit/admin/scripts/ldap_tools/tmp/.`basename $0`.$$.ldt
+
+
+# find the ldap base
+if [[ -s /etc/ldap.conf ]]; then
+   LDC=/etc/ldap.conf
+elif [[ -s /etc/openldap/ldap.conf ]]; then
+   LDC=/etc/openldap/ldap.conf
+fi
+LDAP_BASE=`egrep -i "^base[ \t]" $LDC | sed 's/^base[ \t]//i'`
+
+if [[ -z $LDAP_BASE ]]; then 
+   echo "Unable to find the base dn for LDAP - please make sure ldap is properly"
+   echo "configured on this machine.  If it IS properly configured and you're"
+   echo "still getting this error, you probably need to update the LDAP_SEARCH"
+   echo "variable in this script to something that works with the current config."
+   exit
+fi
+
+if [[ -z $UPDATE_USER ]]; then
+   echo "Unable to locate the correct DN for your user account [$USER]."
+   echo "You must be a member of the domain in order to use this script."
+   exit
+fi
+
+if [[ "$1" == "--help" ]]; then
+   f_Usage
+   exit
+fi
+
+# For auto-generation of UID/GID
+
+START_UID=1100
+MAX_UID=9999
+DEFAULT_GID=1000
+
+# Find next available UID:
+unset NEXT_AVAILABLE
+CHECK=$START_UID
+UIDLIST=" `$LDAP_SEARCH '(uidnumber=*)' uidnumber | grep ^uidnumber: | sed 's/^uidnumber:[ \n]//g'` "
+while [[ -z $NEXT_AVAILABLE ]] && [[ $CHECK -lt $MAX_UID ]]; do
+   #echo "Checking UID $CHECK"
+   #$LDAP_SEARCH -b $LDAP_BASE "(uidNumber=$CHECK)" dn | grep "^dn:"
+   #if [[ -z `$LDAP_SEARCH -b $LDAP_BASE "(uidNumber=$CHECK)" dn | grep "^dn:"` ]]; then
+   if [[ -z `echo $UIDLIST | egrep "${CHECK} | ${CHECK} | ${CHECK}$"` ]]; then
+      #echo "No match for $CHECK"
+      NEXT_AVAILABLE=$CHECK
+   else
+      #echo "Match found for $CHECK, incrementing"
+      let CHECK=$CHECK+1
+   fi
+
+done
+
+
+
+# Get information from the user
+
+echo "--|[Create A User Account]|--"
+echo ""
+VC1=FALSE
+while [[ $VC1 == FALSE ]]; do
+   read -p "Account Username: " GUN
+
+
+   if [[ -n $GUN ]]; then
+      SUN=`echo $GUN | tr -d '\`!@$%^&*()+=/|[]{}:;"\\'\'''`
+      VC1=TRUE
+   else
+      echo "Error: username is not optional."
+      read -p "Press Enter to try another name, Ctrl+C to quit: " JUNK
+      unset GUN SUN
+      tput cuu1; tput el; tput cuu1; tput el; tput cuu1; tput el
+   fi
+
+done
+
+VC2=FALSE
+while [[ $VC2 == FALSE ]]; do
+   read -p "Account numeric UID [$NEXT_AVAILABLE]: " GUID
+   if [[ -n $GUID ]]; then
+      SUID=`echo $GUID | tr -dc "[:digit:]"`
+   
+      # Verify the uid isn't already in use
+      if [[ -z `$LDAP_SEARCH -b $LDAP_BASE "(uidNumber=$SUID)" uid | grep "^uid:"` ]]; then
+         VC2=TRUE
+      else
+         echo "Error: The numeric UID \"$SUID\" is already in use."
+         read -p "Press Enter to try another UID, Ctrl+C to quit: " JUNK
+         unset GUID SUID
+         tput cuu1; tput el; tput cuu1; tput el; tput cuu1; tput el
+      fi
+   else
+      SUID=$NEXT_AVAILABLE
+      VC2=TRUE
+   fi
+
+done
+
+VC3=FALSE
+while [[ $VC3 == FALSE ]]; do
+   read -p "Account numeric GID [$DEFAULT_GID]: " GGID
+   if [[ -n $GGID ]]; then
+      SGID=`echo $GGID | tr -dc "[:digit:]"`
+
+      # Verify the group exists
+      if [[ -n `$LDAP_SEARCH -b $LDAP_BASE "(&(objectClass=posixgroup)(gidNumber=$SGID))" cn | grep "^cn:"` ]]; then
+         VC3=TRUE
+      else
+         echo "Error: no POSIX group with the GID \"$SGID\" found."
+         read -p "Press Enter to try another GID, Ctrl+C to quit: " JUNK
+         unset GGID SGID
+         tput cuu1; tput el; tput cuu1; tput el; tput cuu1; tput el
+      fi
+   else
+      SGID=$DEFAULT_GID
+      VC3=TRUE
+   fi
+
+done
+
+read -p "Account Home Directory [/home/$SUN]: " GHD
+if [[ -n $GHD ]]; then
+   SHD=$GHD
+else
+   SHD=/home/$SUN
+fi
+
+read -p "Account Shell [/bin/bash]: " GSH
+if [[ -n $GSH ]]; then
+   SSH=$GSH
+else
+   SSH=/bin/bash
+fi
+
+read -p "Account Description (GECOS): " GDE
+
+SDE=$GDE
+
+read -sp "Account Initial Password: " GPW
+echo -en "\n\n"
+
+SPW=$GPW
+
+if [[ -f $LDIF_TMP ]]; then
+   /bin/rm $LDIF_TMP
+fi
+
+# Specify the DN of the SUDO role to be edited and specify that we're modifying it
+cat << EOF >> $LDIF_TMP
+dn: uid=$SUN,ou=People,$LDAP_BASE
+cn: $SUN
+uid: $SUN
+uidNumber: $SUID
+gidNumber: $SGID
+homeDirectory: $SHD
+loginShell: $SSH
+gecos: $GDE
+userPassword: $SPW
+objectClass: top
+objectClass: account
+objectClass: posixaccount
+
+EOF
+
+# Write creation details to the backup logs
+if [[ ! -d $BACKUP_DIR ]]; then
+   mkdir -p $BACKUP_DIR
+fi
+LDIF_BAK=${BACKUP_DIR}/user_created_${SUN}_${TS}.ldif
+
+echo "## Script Name: $0" > $LDIF_BAK
+echo "## Executed By/From: `/usr/bin/who -m`" >> $LDIF_BAK
+echo "##" >> $LDIF_BAK
+
+cat $LDIF_TMP >> $LDIF_BAK
+if [[ ! -s $LDIF_BAK ]]; then
+   echo "Error: there was a problem writing the create log for $SUN"
+   exit
+#else
+#   echo "Create log written: $LDIF_BAK"
+fi
+
+
+# Verify LDAP password
+VP=FALSE
+TRIES=0
+while [[ $VP == FALSE ]] && [[ $TRIES -le $MAXTRIES ]]; do
+   read -sp "LDAP Password ($UPDATE_USER): " UUP
+   echo "$LDAP_BT \"$UUP\"" | /bin/bash 2>&1 >/dev/null
+   if [[ $? != 0 ]]; then
+      unset UUP
+      let TRIES=$TRIES+1
+   else
+      echo ""
+      VP=TRUE
+   fi
+done
+
+
+echo "$LDAP_MODIFY -w \"$UUP\" -a -f $LDIF_TMP " | /bin/bash
+if [[ $? != 0 ]]; then
+   echo "There was an error adding the object(s)"
+   echo "The command that failed was:"
+   echo "   $LDAP_MODIFY -W -a -f $LDIF_TMP"
+   echo ""
+   echo "## Update failed" >> $LDIF_BAK
+   exit
+fi
+
+echo "## Update succeeded" >> $LDIF_BAK
+/bin/rm $LDIF_TMP
+
+exit
+

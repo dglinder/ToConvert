@@ -1,0 +1,147 @@
+2.1.1 20151111
+
+20120925 - added libXp.i386 to 5.7/5.8/6.3 64-bit, removed mpcli and old powerpath from post_scripts, updated configure_ldap.sh
+20120926 - moved useradds out of configure_newlinux.sh; added configure_ldap.sh to configure_newlinux.sh
+20120927 - added zadmin user, removed local user adds for RHEL 6, and made LDAP automatic, enabled nfs, disabled avahi-daemon, removed ntp check for VMs, moved directories and service controls from kickstart to post scripts.
+20121012 - changed configure_ldap.sh to remove any existing _machine accounts before adding the current one and set the default crypt for RHEL6 to SHA512.  The password hash for zadmin was changed to SHA512.
+20121016 - added lon13ds01 to the ldapservers.txt file.
+20121018 - fixed a bug with configure_ldap.conf that would cause the machine netgroup to be duplicated in access.conf
+20121022 - corrected a minor issue with configure_ldap.conf - netgroup format for host was incorrect in the machine netgroup.
+20121026 - rolled back service change for 5.8/6.3
+20121030 - removed two names from default_accounts.sh
+20121101 - began changing default root password, modified the configure_bb.sh script to use an rcscript instead of inittab (inittab is deprecated in RHEL6), wrote an upstart script for logsrv and modified configure_newlinux.sh to use the upstart script for RHEL6 instead of trying to add it to inittab.
+20121107 - switched bonding options for RHEL 5 and newer to use miimon
+20121108 - fixed a bug in the bonding script that left the double-quote off the end of the bonding options.
+20121121 - added enable_snmp.sh, changed the "DMZ" question in the post script to "Network Location", incorporated enable_snmp.sh and trapped invalid entries, re-wrote the sendmail config/start portion of configure_bb.sh so it will no longer try to restart a stopped sendmail daemon, changed vmtools installer to skip if already installed
+20121207 - updated configure_ldap.sh to fix a bug where access.conf wasn't restricting which users could log in, and removed COS verbiage from the /usr/bin/passwd stub to reflect the break with COS synchronization of LDAP
+20121219 - fixed a bug with configure_bb.sh that prevents it from properly setting the site code.
+20130107 - added configure_dmzldap.sh to the build process, and added xden06dz01.ds.west.com to the ldapservers.txt
+20130109 - updated configure_newlinux.sh, configure_rlinux.sh to add "initctl emit startup" to ensure that upstart scripts are triggered at boot, updated the startup conditions so logsrv will start automatically
+20130110 - updated update_net.sh to cast all hostnames in lower case.
+20130114 - updated configure_ldap.sh to add pre-checks and added explicit paths to prevent pathing issues when run with sudo.
+20130115 - updated default_accounts.sh - removed one user and changed account names of two admins to match LDAP account names.
+20130117 - updated default_accounts.sh - added a "zadmin" group for the zadmin account.
+20130121 - updated configure_newlinux.sh, configure_rlinux.sh to leave default NSCD settings for RHEL6 and RHEL5.9+
+20130123 - updated configure_newlinux.sh - replaced all references to "/wic" to "/opt"
+20130124 - updated configure_newlinux.sh - all systems will be configured for LDAP by default, updated common_functions.h to use arping instead of ping to detect default gateway - some gateways are apparently configued to drop icmp, updated default_accounts.sh to remove local account creation, updated configure_ldap.sh to include exit codes and better handle being used on cloned systems, and to allow service accounts to run cron via access.conf
+20130125 - updated configure_ldap.sh to attempt to self-update whenever it is run.
+20130129 - fixed a bug with configure_newlinux.sh that was causing systems to hang on startup after it was run
+20130204 - fixed a problem with insecure protocols in configure_newlinux.sh and updated configure_ldap.sh to explicitly set a TERM variable if not already set.
+20130225 - modified firewall rules
+20130226 - added xorg-x11-apps to RHEL 6 base install
+20130308 - changed ldap 'bind_policy' for <=RHEL5 to 'soft' to allow local users to log in when network is unavailable.
+20130311 - fixed multiple issues with configure_dmzldap.sh to account for lack of standard deployment methods, fixed configure_ldap.sh to stop adding duplicates to /etc/hosts, added a new f_IsHostValid function to the common_functions.h library.
+20130312 - made minor changes to the notification email sent by configure_bb.sh per Service Desk team's request.
+20130312 - removed cfengine from the build, removed sabdna user from the build, miscellaneous houskeeping on the post_scripts directory
+20130402 - added logging and minor logic updates to configure_newlinux.sh and configure_bb.sh
+20130405 - corrected the default iptables build configuration to include access from all internal subnets, not just 10/8.
+20130408 - minor updates to ldap scripts to add xatl01dz01
+20130408b - added a daily touch to /var/log/wtmp in an attempt to prevent clean_machine from removing it.
+20130408c - added some interim logrotate configurations to prevent archiving of links to /var/log/messages, and to fix wtmp rotation
+20130409 - simplified the dmz post-install process by changing configure_rlinux.sh and configure_rldap.sh to configure_dmzlinux.sh and configure_dmzldap.sh and added some logging for them.  configure_dmzldap.sh will comment out all lines in /etc/resolv.conf to prevent timeouts on DNS lookups that will never work.
+20130509 - updated configure_newlinux.sh & configure_dmzlinux.sh - Added the removal of 90-nproc.conf as this was overriding settings in limits.conf for RHEL6
+20130509b - fixed a bug and made some modifications to make.motd.sh to make it more compatible with cloning. Added rhelprep.sh to prep RHEL6 boxes for being turned into VMWare templates.
+20130514 - replaced ConfigureSyslog.pl with configure_syslog.sh, updated configure_ldap.sh so it will attempt to download "common_functions.h" if run on a system where it is missin, updated names in sitelist.cfg
+20130516 - created sshd_setup.sh, relocating a few lines of configure_newlinux.sh and configure_dmzlinux.sh to it, and adding a public key from linux1410 for the exclusive use of the admins
+20130523 - removed the ping portion of the f_IsHostValid common function because some environments deny ICMP, and made a minor correction in configure_dmzldap.sh to correctly choose a log file
+20130524 - removed the AppAdmin_users from the default machine netgroup creation in configure_ldap.sh
+20130524b - made some minor changes to configure_ldap.sh, should not change script function
+20130524c - updated configure_syslog.sh to append ";sysklogd" to network logging targets when rsyslog is used - this is to prevent doubling the system name when logging
+20130528 - began removing unneeded local accounts as part of the standard build, added some subnet logic functions to common_functions.h
+20130610 - changed the f_IsNetUp function to use both ping and arping to check the gateway for connectivity.
+20130617 - made the success of configure_ldap.sh a requirement of configure_newlinux.sh - the script will now exit with an error if LDAP is not configured. Added a -ua switch to configure_ldap.sh to prevent prompting the user. Updated the DNS servers checked by the AtWest function. Updated the default DNS servers in all current kickstart scripts.
+20130619 - changed configure_newlinux.sh logic to remove unneeded Intercall local account logic. Intercall will have the same static DNS config, but non-intercall servers will all be configured with configure_dns.sh, which will automatically determine the closest site-specific DNS servers and primary servers based on the contents of /maint/scripts/dnsservers.txt.
+20130710 - sjs - Updated common_functin f_AtWest to include west.com as a domain to look for when verifying DNS lookups.
+20130719 - updated permissions on west-only logfiles in configure_syslog.sh
+20130724 - made another minor fix to configure_syslog.sh - permissions were not being set correctly by previous update.
+20130730 - complete re-write of configure_syslog.sh to increase consistency with legacy processes. A "debug" mode was added to turn off external logging during build and development, custom log rotation scripting controls the west legacy log files. Legacy files are rotated at midnight rather than by cron.daily.
+20130805 - removed automatic SNMP configuration from the build process per Spectrum team.
+20130821 - added a line to the internal IPTables configuration to address NFS issues
+20130913 - Updated configure_ldap.sh and configure_dmzldap.sh to set "idle_timelimit" to 300 seconds to prevent runaway processes from overloading the LDAP servers with open connections.  Turned off Red Hat license service by default.
+20130913 - Fixed a problem where configure_newlinux.sh and configure_dmzlinux.sh did not abort on ldap config failure.
+20130924 - Changed configure_ldap.sh and configure_dmzldap.sh to skip firewalled LDAP servers faster.  Changed configure_syslog.sh to fix a bug when encountering unexpected fields in the "expcfg" file.
+20131009 - Added InfoSec SIEM logging details to default logging configuration.
+20131018 - Changed configure_ldap.sh to require admin login to add a machine netgroup, and the IP and adding user name to the machine netgroup's description. Added verbiage about the new fields to configure_dmzldap.sh.
+20131022 - Fixed a bug in configure_syslog.sh that would cause compression overrides in configure_syslog.conf to be ignored if the target file was set not to use fsync (prefixed with a - in the [r]syslog.conf)
+20131022a - Changed the wording in the configure_dmzldap.sh script to "Hostname" instead of "Netgroup Name" so it was more aligned with the process of using ng_create.sh
+20131023 - Added xswn01dz01 to ldapservers.txt and configure_dmzldap.sh
+20131029 - Added xlon13dz01 and xlon13dz02 to ldapservers.txt and configure_dmzldap.sh
+20131030 - Added xsin10dz01 and xsin10dz02 to ldapservers.txt and configure_dmzldap.sh
+20131119 - Updated configure_syslog.sh to allow for specifying/changing port numbers for remote logging
+20131125 - Updated an incorrect comment in the auto-generated conf file for configure_syslog.sh
+20131202 - Updated configure_newlinux.sh to ensure that the site number is written before configure_syslog.sh is run on a new build.
+20131211 - Updated the f_ValidIPV4 function in common_functions.h to be more backwards compatible with older versions of BASH
+20140530 - Almost complete overhaul of post-installation processes.
+20140602 - Updated ldapservers.txt and setup_ldap.sh to include the new DMZ server xoma01dz01.ds.west.com
+20140605 - Fixed a bug in setup_ldap.sh which caused lookup failures in the DMZ. Also added verbiage to explain manually installing a "cacert.asc".
+20140619 - re-embedded vmtools into the standalone ISO process
+20140620 - modified setup_dns.sh to check for and add "dns" to hosts in nsswitch.conf in case it was removed.
+20140620 - modified setup_hw_config.sh to behave better in the DMZ when trying to install Director.  Modified setup_linux.sh to prevent concurrent attempts to run.
+20140620 - corrected a logic error in setup_server_statement_of_origin.sh that caused it elect invalid LDAP servers for initial authentication
+20140625 - corrected syntax problem with setup_hw_tools.sh on line 72, a missing "fi" that prevented the script from running.
+20140702 - fixed a bug in configure_syslog.sh where rsyslog was not being properly detected and special directives were being omitted.
+20140702b- increased the size of /var/cache/yum on all images to deal with RHSS increasing the need.
+20140703 - fixed a bug in setup_ntp.conf that detected virtuals as physicals and vice-versa.
+20140806 - updated setup_dns.sh, reconfigure_dns.sh, and common_functions.h to reflect changes to the internal DNS environment.
+20140806b - updated initialize_dns.sh to reflect changes to the internal DNS environment.
+20140808 - corrected a logging error on setup_statement_of_origin.sh - fixed the f_FindPubIP function in common_functions.h to include full pathing for ifconfig
+20140821 - den06ds02 and den06ds03 built and added to ldapservers.txt
+20140922 - setup_ldap.sh setup to provide fallback when port 80 is unavailable.
+20140930 - configure_syslog.sh updated to allow adding arbitrary directives to rsyslog.conf
+20141013 - updated setup_ldap.sh to increase accuracy of serial number matching, revised rhelcloneprep.sh to better suit the WC1/WC2 template environment.  Added setup_rhss.sh.
+20141014 - slight update to setup_rhss.sh
+20150312 - (adm) setup_hw_tools.sh was modified to automatically register new server builds with IBM Director.
+20150413 - setup_ldap.sh was modified to support west cloud builds.
+20150416 - (adm) Increased /var/cache/yum from --size=2560 to --size=4096 for RHSS cache space purposes.
+20150428 - Update rhelcloneprep.sh to remove non-standard user home directories, removing any lingering .svn directories, clear root history and lingering files in tmp, etc, and /var/log/clean_machine, fix some file ownership issues, reset Hyperic agent data files.
+20150507 - Removal of non-production test files (ldapservers.txt.predan.141120a, reconfigure_dns.sh.orig, and setup_dns.sh.new).  Add review of home directories remaining, fix clonecheckd daemon service addition,  add additional cleanup steps to /root/, /var/tmp/ and other locations, and add Hyperic agent cleanup steps to rhelcloneprep.sh.
+20150508 - Initial addition of security script with basic sysctl.conf changes to address some InfoSec/Nexpose scan report findings.
+20150508 - (dglinder) Rewrite of the unattended mode check code to add ability to choose method to run from command line while supporting existing script calls.
+20150511 - (dglinder) Remove the initial regen_hypericagent.sh script to avoid confusion.
+20150511 - (adm) updated setup_ldap.sh to use commas for the URI listing, instead of spaces.
+20150511 - (adm) updated bb hosts parameters per SDR 6538281 - requested by Shefl, approved by Moeller.
+20150511 - (adm) updated all images to include a 6gb partition for openv (netbackup agent).
+20150513 - (dgl) Modified vmware tools package to recompile on reboot.  This will stop vmtools from breaking after OS patches update kernels and kernel headers.
+20150513 - (adm) Removed gnome desktop meta package from ks5_u11 build image.  
+20150513 - (adm) Removed "System Tools" from ks5_u11 to stop installing samba - added other packages manually to compensate.
+20150513 - (adm) Sorted and removed duplicates from ks5_u11 package adds/removes.
+20150513 - (adm) Removed "Network File system client" meta package from ks6_u6 to stop installing samba - added individual packages back in to compensate.
+20150513 - (adm) Removed a line from setup_hostname.sh that was rewriting "127.0.0.1 localhost.localdomain" to read "127.0.0.1 linux####" this was causing sendmail to hang on startup because localhost was not defined.
+20150513 - (adm) Removed lines from setup_services.sh that were removing sendmail from startup, and re-adding it, effectively turning it on by default, which is something the script was turning off in the step before.  Scripted notes say this should not be on by default.
+20150514 - (adm) adding vim-common vim-enhanced packages to rhel5 kickstart, these were being installed as part of gnome.
+20150514 - (adm) modified common_functions.h to update the host rename function which was overwriting localhost.localdomain.
+20150518 - (dglinder) Add code to create the West "/data/westcorp" directory tree for the West Cloud, and perform a more through cleanup of the previous Hyperic agent data files.
+20150518 - (dglinder) Create file to handle West Cloud specific tweaks outside of the rhelcloneprep.sh script.
+20150518 - (dglinder) Remove steps only necessary for the West Cloud images.
+20150518 - (dglinder) Setup agent to use provided Java binary, clean up common variables.
+20150519 - (dglinder) Created setup_security.sh to apply tcp redirect settings per Infosec.
+20150519 - (amayberr) Added the new setup_security.sh to the setup_linux.sh script so that it will be applied to all builds.
+20150522 - (dglinder) Addition of code to the proper setup script to update the VMware kernel modules to auto-update upon kernel or other system updates.
+20150526 - (dglinder) Clean up the hyperic log directory, and remove any pre-existing copies of the firewall entries before re-adding them.
+20150526 - (dglinder) Additional cleanup and ensure the VMware tools start correctly.
+20150526 - (dglinder) Remove the long sleep and poweroff, moved to cloud clone prep script.
+20150526 - (dglinder) Give user 30 seconds to react, then power off system.  This is necessary because the VMware tools are stopped and we are unable to perform a clean shutdown if necessary.
+20150526 - (dglinder) Add common functions code for use in script.
+20150527 - (dglinder) Fix the code that was blanking out the /etc/issue and /etc/issue.net files.
+20150527 - (dglinder) Fix clone prep steps, ensure that the vmware-tools daemon is restarted and running after the first boot.
+20150527 - (dglinder) Increase time to wait for LDAP population from 2 minutes to 5 due to some LDAP servers taking longer to get replica than previously expected.
+20150527 - (dglinder) Add the Hyperic auto-approve.properties file from the Linux157 server.  Also redirect error output from the "mv" commands to /dev/null, and fix a minor spelling error.
+20151007 - (amayberr) Updating to RHEL6.7 base ISO.  Including SSSD a RHEL6 build option.
+20151007 - (amayberr) Adding sssd package to kickstart for rhel6.7.
+20151007 - (amayberr) Updating setup_linux.sh to change step 800 from "setup_ldap.sh" to "setup_auth.sh" this will cleanly allow me to call either setup_ldap.sh or setup_ldap-sssd.sh depending on the chosen option.
+20151007 - (amayberr) Creating setup_auth.sh script, which will prompt the user for an authentication service, and call the appropriate setup script.
+20151007 - (amayberr) Updated Motd script site location example help text from "OMA01" to "DEN06".
+20151007 - (amayberr) Updated sitelist.cfg to note sites scheduled for evacuation.
+20151013 - (amayberr) Removed the sssd packages from the kickstart profile.  SSSD packages interfere with legacy NSS.  Moved SSSD packages to the setup_ldap-sssd.sh script as a blind yum install, no pre-checks.  It's either there, or it will be, or it can't be because satellite registration failed.
+20151013 - (amayberr) added satellite registration to the kickstart process.  All builds will now be registered by default.
+20151013 - (amayberr) modified setup_rhss.sh to parse /etc/sso to determine appropriate BU and translate to the proper registration key.  Supplying a BU at the command line as an argument overrides this behavior. WAN and WBS are merged in to WIC, any unrecognized entry will pass through as the BU identifier to the next step in the process, in case something changes later.
+20151111 - (amayberr) Added setup_rhss-autopatch.sh to the build process, automating patching. Old setup_rhss.sh doesn't patch by default, for use when systems need registration only.
+20151111 - (amayberr) /boot partition increased from 150mb to 1.5gb on 6_u7 and 5_u11 builds.
+20151111 - (amayberr) setup_files scripts updated to change default permissions on /maint and /maint/scripts from 777 to 755.
+20151111 - (amayberr) added legacy DMZ subnets to common_functions.h. These shouldn't be used going forward.  216.57.96.0/20 199.38.32.0/20 199.38.48.0/22 155.254.144.0/20 63.234.247.48/29
+<<<<<<< .mine
+20151217 - (amayberr) Infosec requires single user mode to require a root password.  Updated setup_ldap script accordingly.
+=======
+20151208 - (dglinder) Add the TESTING flag to ease the validation of new verions of binaries and configuration files.
+>>>>>>> .r146
+20160415 - (amayberr) updated setup_ldap.sh to use '|sort |uniq -w 8 | sort -t , -k2 -n | head -5' instead of '| sort -t , -k2 -n | head -5' --  The practical impact will be 5 servers in nslcd.conf instead of 3, and only the fastest server from each site will be used.  I.E. a server in longmont will only get the fastest den06 server, not all 3 den06 servers.  Also, anything older than RHEL5 is now administratively prevented from being configured with this script.  TLS restriction in 2017 will prevent RHEL5 and older from being connected to our directory services, so there is no point in allowing RHEL4/RHEL3 to be configured (we've never had anyone use it there anyway)

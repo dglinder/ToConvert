@@ -1,0 +1,631 @@
+#!/bin/bash
+
+###########################################
+# Purpose: Edit A SUDOers role
+# Author: SDW
+# Incept 08/08/2012
+
+# Notes: - basic LDAP authentication must already be configured and working
+#          on the server where this script is run from
+f_Usage () {
+   echo "$0 USAGE"
+   echo ""
+   echo "$0 <SUDO role name>"
+   echo ""
+   echo "   OR"
+   echo ""
+   echo "$0 -x <SUDO role name>"
+   echo ""
+   echo ""
+   echo "   Opens a SUDO role up for editing. If a role name is not"
+   echo "   speified on the command line, you will be prompted to provide"
+   echo "   one."
+   echo ""
+   echo "   -x will export the sudo role to <SUDO role name>.role so it can"
+   echo "   be edited and used as input for sudo_add_role.sh -f.  Note: this"
+   echo "   function is intended for cloning sudo roles - sudo_add_role.sh will"
+   echo "   not import a role that already exists."
+   echo ""
+   echo "   Note: SUDO roles cannot be re-named. You will need to create"
+   echo "   a new role and delete the old one."
+   echo ""
+}
+
+# Set path to the location of the script no matter how it was invoked
+if [[ `echo $0 | sed 's/^.\///g'` == `basename $0` ]]; then
+   WORKDIR=`pwd`
+else
+   BASENAME=`basename $0`
+   WORKDIR=`echo $0 | sed 's/'"$BASENAME"'$//g'`
+fi
+
+USERDIR=`pwd`
+
+cd $WORKDIR
+
+# Set some basic options for ldap searching, durrently the directory server doesn't require a binddn or a rootbinddn
+# so simple authentication should work fine
+LDAP_SEARCH="/usr/bin/ldapsearch -x -ZZ"
+UPDATE_USER=`ldapsearch -x -ZZ "(uid=$USER)" dn | grep ^dn: | sed 's/^dn:[ \t]//'`
+LDAP_MODIFY="/usr/bin/ldapmodify -x -ZZ -D \"$UPDATE_USER\""
+LDAP_BT="$LDAP_SEARCH '(ou=SUDOers)' -D \"$UPDATE_USER\" -w"
+MAXTRIES=5
+
+# Temp file to hold any ldif that we might need to push to the directory
+LDIF_TMP=/eit/admin/scripts/ldap_tools/tmp/.`basename $0`.$$.ldt
+LDIF_IN_TMP=/tmp/$$.ser.$$.ldt
+EDITFILE=/tmp/$$.seef
+BACKUP_DIR=/eit/admin/scripts/ldap_tools/local_backup
+TS=`date +%Y%m%d%H%M%S`
+
+# find the ldap base
+if [[ -s /etc/ldap.conf ]]; then
+   LDC=/etc/ldap.conf
+elif [[ -s /etc/openldap/ldap.conf ]]; then
+   LDC=/etc/openldap/ldap.conf
+fi
+LDAP_BASE=`egrep -i "^base[ \t]" $LDC | sed 's/^base[ \t]//i'`
+
+if [[ -z $LDAP_BASE ]]; then 
+   echo "Unable to find the base dn for LDAP - please make sure ldap is properly"
+   echo "configured on this machine.  If it IS properly configured and you're"
+   echo "still getting this error, you probably need to update the LDAP_SEARCH"
+   echo "variable in this script to something that works with the current config."
+   exit
+fi
+
+if [[ -z $UPDATE_USER ]]; then
+   echo "Unable to locate the correct DN for your user account [$USER]."
+   echo "You must be a member of the domain in order to use this script."
+   exit
+fi
+
+# Find base DNs
+SUDO_BASE=`$LDAP_SEARCH '(ou=SUDOers)' | grep "dn: ou" | awk '{print $2}'`
+NG_BASE=`$LDAP_SEARCH '(ou=Netgroups)' | grep "dn: ou" | awk '{print $2}'`
+
+# If there is no Netgroups OU then we need to create the OU
+if [[ -z $SUDO_BASE ]]; then 
+  echo "No SUDOers OU was found at $LDAP_BASE..."
+  echo "Please run the appropriate script from directory-setup"
+  echo "and try again."
+  exit
+fi
+
+# If there is no Netgroups OU then we need to create the OU
+if [[ -z $NG_BASE ]]; then
+  echo "No Netgroup OU was found at $LDAP_BASE..."
+  echo "Please run the appropriate script from directory-setup"
+  echo "and try again."
+  exit
+fi
+
+
+# Get information from the user
+
+SRTBE=$1
+unset EXPORTONLY
+
+# If we got a name from the command line
+if [[ -n $SRTBE ]]; then
+
+   if [[ "$SRTBE" == "--help" ]]; then
+      f_Usage
+      exit
+   fi
+
+   # If we caught -x, shift everything over
+   if [[ "$SRTBE" == "-x" ]]; then
+      SRTBE=$2
+      if [[ -n $SRTBE ]]; then
+         EXPORTONLY=Y
+      else
+         f_Usage
+         exit
+      fi
+   fi
+
+   if [[ -n `echo $SRTBE | grep -i "^defaults$"` ]]; then
+      echo "ERROR: You may not edit the \"defaults\" role!"
+      exit
+   fi
+
+   # Verify the netgroup exists
+   if [[ -z `$LDAP_SEARCH -b $SUDO_BASE "(cn=${SRTBE})" 2>&1 | egrep -v '^#|^$|^search|^result'` ]]; then
+      echo "ERROR: SUDOers role \"$SRTBE\" not found in the directory."
+      exit
+   else
+      SRTBEDN=`$LDAP_SEARCH -b $SUDO_BASE "(cn=${SRTBE})" dn | sed ':a;N;$!ba;s/\n //g' | grep $SRTBE | grep ^dn: | sed 's/^dn: //g'`
+   fi
+
+# If we did NOT get a name from the command line 
+else 
+
+   # Prompt the user for a name
+   VC2=FALSE
+   while [[ $VC2 == FALSE ]]; do
+      unset GSRTBE
+      read -p "What is the name of the SUDOers role to be edited?: " GSRTBE
+
+      # Check for non-existence - retry on error
+      if [[ -z `$LDAP_SEARCH -b $SUDO_BASE "(cn=${GSRTBE})" 2>&1 | egrep -v '^#|^$|^search|^result'` ]]; then
+         echo "ERROR: SUDOers role \"$GSRTBE\" not found in the directory."
+         read -p "Press Enter to try a different name, Ctrl+C to cancel." JUNK
+         tput uu1; tput el; tput uu1; tput el; tput uu1; tput el
+      elif [[ -n `echo $GSRTBE | grep -i "^defaults$"` ]]; then
+         echo "ERROR: You may not delete the \"defaults\" role!"
+         read -p "Press Enter to try a different name, Ctrl+C to cancel." JUNK
+         tput uu1; tput el; tput uu1; tput el; tput uu1; tput el
+      else
+         VC2=TRUE
+         SRTBE=$GSRTBE
+         SRTBEDN=`$LDAP_SEARCH -b $SUDO_BASE "(cn=${SRTBE})" dn | sed ':a;N;$!ba;s/\n //g' | grep $SRTBE | grep ^dn: | sed 's/^dn: //g'`
+      fi
+   done
+fi
+
+# Output the sudorole to a temp file
+
+#$LDAP_SEARCH -b $SUDO_BASE "(cn=${SRTBE})" | egrep -v '^#|^$|^search|^result' | sed ':a;N;$!ba;s/\n //g'> $LDIF_IN_TMP
+$LDAP_SEARCH -b "$SRTBEDN" | egrep -v '^#|^$|^search|^result' | sed ':a;N;$!ba;s/\n //g'> $LDIF_IN_TMP
+
+# Start the edit file
+
+echo "###ROLE NAME ##############" > $EDITFILE
+echo "# DO NOT CHANGE ROLE NAME" >> $EDITFILE
+echo "###########################" >> $EDITFILE
+echo "ROLE_NAME: $SRTBE" >> $EDITFILE
+echo "" >> $EDITFILE
+
+# Add the user list
+
+echo "##USERS##############################################" >> $EDITFILE
+echo "# You may specify as many USER lines as you like" >> $EDITFILE
+echo "# USER must refer to a user netgroup, not an individual user" >> $EDITFILE
+echo "# Use a separate line for each user netgroup" >> $EDITFILE
+echo "#####################################################" >> $EDITFILE
+if [[ -n `grep '^sudoUser:' $LDIF_IN_TMP` ]]; then
+   grep '^sudoUser:' $LDIF_IN_TMP | sed 's/^sudoUser:/USER:/g; s/+//g' >> $EDITFILE
+else
+   echo "#USER: " >> $EDITFILE
+fi
+echo "" >> $EDITFILE
+
+
+# Add the host list
+
+echo "##HOSTS##############################################" >> $EDITFILE
+echo "# You may specify as many HOST lines as you like" >> $EDITFILE
+echo "# HOST must refer to a host or machine netgroup" >> $EDITFILE
+echo "# Use a separate line for each host or machine netgroup" >> $EDITFILE
+echo "# You may use the keyword "ALL" to specify that this" >> $EDITFILE
+echo "# role may be used anywhere." >> $EDITFILE
+echo "#####################################################" >> $EDITFILE
+if [[ -n `grep '^sudoHost:' $LDIF_IN_TMP` ]]; then
+   grep '^sudoHost:' $LDIF_IN_TMP | sed 's/^sudoHost:/HOST:/g; s/+//g' >>$EDITFILE
+else
+   echo "#HOST: " >> $EDITFILE
+fi
+echo "" >> $EDITFILE
+
+# Add the host list
+
+#echo "##HOSTS##############################################" >> $EDITFILE
+#echo "# You may specify as many HOST lines as you like" >> $EDITFILE
+#echo "# Use a separate line for each host." >> $EDITFILE
+#echo "# You may use the keyword "ALL" to specify that this" >> $EDITFILE
+#echo "# role may be used anywhere." >> $EDITFILE
+#echo "#####################################################" >> $EDITFILE
+#grep '^sudoHost:' $LDIF_IN_TMP | sed 's/^sudoHost:/HOST:/g; s/+//g' >>$EDITFILE
+#echo "" >> $EDITFILE
+
+# Add the command list
+
+echo "##COMMANDS###########################################" >> $EDITFILE
+echo "# You may specify as many COMMAND lines as you like" >> $EDITFILE
+echo "# Use a separate line for each individual command" >> $EDITFILE
+echo "# Remember to use full paths for commands" >> $EDITFILE
+echo "# You may use the keyword "ALL" to specify that" >> $EDITFILE
+echo "# this role will enable the user to execute any command" >> $EDITFILE
+echo "#####################################################" >> $EDITFILE
+if [[ -n `grep '^sudoCommand' $LDIF_IN_TMP` ]]; then
+   grep '^sudoCommand: ' $LDIF_IN_TMP | sed 's/^sudoCommand:/COMMAND:/g' >>$EDITFILE
+   grep '^sudoCommand:: ' $LDIF_IN_TMP | sed 's/^sudoCommand:://g' | perl -MMIME::Base64 -0777 -ne 'print decode_base64($_)' | sed 's/^/COMMAND: /g' >>$EDITFILE
+else
+   echo "#COMMAND: " >> $EDITFILE
+fi
+echo "" >> $EDITFILE
+
+# Add the password ask
+
+echo "##REQUIRE PASSWORD###################################" >> $EDITFILE
+echo "# Should the user be asked for a password when" >> $EDITFILE
+echo "# executing the commands in this role with sudo?" >> $EDITFILE
+echo "# Options are "YES" or "NO"" >> $EDITFILE
+echo "# Default is "YES"" >> $EDITFILE
+echo "#####################################################" >> $EDITFILE
+if [[ -n `grep '^sudoOption: !authenticate' $LDIF_IN_TMP` ]]; then
+   echo "ASKPASSWORD: NO" >> $EDITFILE
+else
+   echo "ASKPASSWORD: YES" >> $EDITFILE
+fi
+echo "" >> $EDITFILE
+
+# SUDO Option
+
+echo "##SUDO OPTION########################################" >> $EDITFILE
+echo "# Apply generic sudo options" >> $EDITFILE
+echo "# Each option must be specified on its own line" >> $EDITFILE
+echo "# Recommended options:" >> $EDITFILE
+echo "#    Use the \"NOEXEC\" option when giving the ALL command" >> $EDITFILE
+echo "#    to prevent dynamic linking.  This will prevent users" >> $EDITFILE
+echo "#    from simply writing a script to get around restrictions" >> $EDITFILE
+echo "#    that deny specific actions such as \"su -\"." >> $EDITFILE
+echo "#    With this option turned on, scripts must be run as" >> $EDITFILE
+echo "#    the user with sudo used inline." >> $EDITFILE
+echo "#####################################################" >> $EDITFILE
+if [[ -n `grep '^sudoOption:' $LDIF_IN_TMP | grep -v 'authenticate'` ]]; then
+   grep "^sudoOption:" $LDIF_IN_TMP | grep -v 'authenticate' | sed 's/^sudoOption:/OPTION:/g' >> $EDITFILE
+else
+   echo "#OPTION: " >> $EDITFILE
+fi
+echo "" >> $EDITFILE
+
+echo "##RUNAS USER#########################################" >> $EDITFILE
+echo "# Ordinarily SUDO roles are used to run commands as root" >> $EDITFILE
+echo "# however they can also be configured to allow commands to be" >> $EDITFILE
+echo "# run as a specific user." >> $EDITFILE
+echo "#" >> $EDITFILE
+echo "# Specifying a user with RUNAS will apply to this entire" >> $EDITFILE
+echo "# role." >> $EDITFILE
+echo "#" >> $EDITFILE
+echo "# You may only specify one RUNAS user per role" >> $EDITFILE
+echo "#" >> $EDITFILE
+echo "# If RUNAS is not set, it is assumed to be root" >> $EDITFILE
+echo "#####################################################" >> $EDITFILE
+if [[ -n `grep '^sudoRunAsUser:' $LDIF_IN_TMP` ]]; then
+   grep "^sudoRunAsUser:" $LDIF_IN_TMP | sed 's/^sudoRunAsUser:/RUNAS:/g' >> $EDITFILE
+else
+   echo "#RUNAS: " >> $EDITFILE
+fi
+echo "" >> $EDITFILE
+
+
+# Add the description
+echo "##ROLE DESCRIPTION###################################" >> $EDITFILE
+echo "# The description should be brief, one line and provide" >> $EDITFILE
+echo "# enough information to know what the role does and who" >> $EDITFILE
+echo "# it was intended for." >> $EDITFILE
+echo "#####################################################" >> $EDITFILE
+#DSTRING=`$LDAP_SEARCH -b $SUDO_BASE "(cn=${SRTBE})" description | egrep -v '^#|^$|^search:|^result:|^dn:' | sed 's/^ //g' | sed ':a;N;$!ba;s/\n//g; s/ //'`
+DSTRING=`grep -i "^description:" $LDIF_IN_TMP`
+if [[ -n `echo $DSTRING | grep -i "^description::"` ]]; then
+    BASE64DESC=`echo $DSTRING | grep -i "^description::" | sed 's/^description:://i'`
+    DESC=`echo $BASE64DESC | perl -MMIME::Base64 -0777 -ne 'print decode_base64($_)'`
+    echo "DESCRIPTION: $DESC" >> $EDITFILE
+elif [[ -n `echo $DSTRING | grep -i "^description:"` ]]; then
+    DESC=`echo $DSTRING | grep -i "^description:" | sed 's/^description://i'`
+    echo "DESCRIPTION: $DESC" >> $EDITFILE
+else
+    echo "DESCRIPTION: " >> $EDITFILE
+fi
+
+# The editable update file has been built, now we need to record the md5sum
+# so we can tell if it was changed.
+
+if [[ -n $EXPORTONLY ]]; then
+  SRN=`echo $SRTBE | sed 's/_role$//g'`
+  EXPORTFILE="${USERDIR}/${SRN}.role"
+  /bin/mv $EDITFILE $EXPORTFILE
+  echo "$SRTBE has been exported to $EXPORTFILE"
+  exit
+fi
+
+BEFORE_MD5=`md5sum $EDITFILE | awk '{print $1}'`
+
+# keep editing the file until the user quits or verification passes
+VERIFIED=FALSE
+while [[ $VERIFIED == FALSE ]]; do
+
+
+   vim $EDITFILE
+
+   # Next, check the file for updates
+
+   AFTER_MD5=`md5sum $EDITFILE | awk '{print $1}'`
+
+   if [[ "$AFTER_MD5" == "$BEFORE_MD5" ]]; then
+      echo "No changes made - nothing to update."
+      /bin/rm $EDITFILE
+      /bin/rm $LDIF_IN_TMP
+      exit
+   fi
+
+   # If updates were found, then check them
+
+
+   echo ""
+   echo "Checking the edited file for errors..."
+   echo ""
+   
+
+   # Start with the assumption that everything checks out.  Any one
+   # Failure will change this value
+   FAILURE=NO
+
+   # Check name
+   echo "Checking Name"
+   RN=`grep "^ROLE_NAME:" $EDITFILE | sed 's/^ROLE_NAME: //; s/^ROLE_NAME://'`
+   if [[ $RN != $SRTBE ]]; then
+      echo "Error: ROLE_NAME does not match the role being edited!"
+      FAILURE=YES
+   fi
+   
+   # Check users list
+   unset SUS
+   for SU in `grep "^USER:" $EDITFILE | sed 's/^USER: //g; s/^USER://g'`; do
+      if [[ -z `$LDAP_SEARCH -b $NG_BASE "(cn=$SU)" cn | grep "^cn:"` ]]; then
+         echo "Error: user netgroup \"$SU\" does not exist in the directory."
+         FAILURE=YES
+      elif [[ -z `echo $SU | egrep "_users$|_sa$"` ]]; then
+         echo "Error: \"$SU\" is not a user netgroup."
+      else
+        if [[ -z $SUS ]]; then
+           SUS=$SU
+        else
+           SUS="$SUS,$SU"
+        fi
+      fi
+
+   done  
+
+   # Check hosts list
+#   unset SHS
+#   for SH in `grep "^HOST:" $EDITFILE | sed 's/^HOST: //g; s/^HOST://g'`; do
+#      if [[ -z `$LDAP_SEARCH -b $NG_BASE "(nisNetgroupTriple=\(,$SH,\))" nisNetgroupTriple | grep "^nisNetgroupTriple:" | head -1` ]]; then
+#         if [[ $SH != ALL ]]; then
+#            echo "Error: host \"$SH\" does not exist in the directory."
+#            FAILURE=YES
+#         else
+#            SHS=$SH
+#         fi
+#      elif [[ -n `echo $SH | egrep "_users$|_hosts$|_machine$"` ]]; then
+#         echo "Error: Netgroups are not currently supported."
+#         FAILURE=YES
+#      else
+#        if [[ -z $SHS ]]; then
+#           SHS=$SH
+#        else
+#           SHS="$SHS,$SH"
+#        fi
+#      fi
+#
+#   done
+
+   # Check hosts list
+   unset SHS
+   for SH in `grep "^HOST:" $EDITFILE | sed 's/^HOST: //g; s/^HOST://g'`; do
+      if [[ -z `$LDAP_SEARCH -b $NG_BASE "(cn=$SH)" cn | grep "^cn:"` ]]; then
+         if [[ $SH != ALL ]]; then
+            echo "Error: host netgroup \"$SH\" does not exist in the directory."
+            FAILURE=YES
+         else
+            SHS=$SH
+         fi
+      elif [[ -z `echo $SH | egrep "_hosts$|_machine$"` ]]; then
+         echo "Error: \"$SH\" is not a host or machine netgroup."
+         FAILURE=YES
+      else
+        if [[ -z $SHS ]]; then
+           SHS=$SH
+        else
+           SHS="$SHS,$SH"
+        fi
+      fi
+
+   done
+
+   # Check RUNAS setting
+
+   # Make sure that there is only one RUNAS user specified
+   if [[ `grep '^RUNAS:' $EDITFILE | wc -l` -gt 1 ]]; then
+      echo "Error: you may only specify one RUNAS user"
+      FAILURE=YES
+   fi
+
+   # See if a RUNAS user is specified
+   RAU=`grep "^RUNAS:" $EDITFILE | sed 's/^RUNAS: //; s/^RUNAS://'`
+
+   # if a user is specified, but not in the directory then throw an error
+   if [[ -n $RAU ]] && [[ -z `$LDAP_SEARCH "(uid=$RAU)" uid | grep "^uid:"` ]]; then
+      echo "Error: RUNAS user $RAU does not exist in the directory"
+      FAILURE=YES
+   fi
+
+
+
+   # Read in password requirement - technically this is optional
+   # so unless we get a no, we'll assume a yes
+
+   SPR=`grep "^ASKPASSWORD:" $EDITFILE | sed 's/^ASKPASSWORD: //; s/^ASKPASSWORD://'`
+   if [[ -n `echo $SPR | grep -i 'NO'` ]]; then
+      SPR=NO
+   else
+      SPR=YES
+   fi
+
+   # Not really going to do any syntax checking on the commands, but we'll make
+   # sure there's at least one defined.
+
+   if [[ -z `grep "^COMMAND:" $EDITFILE` ]]; then
+      echo "Error: no commands found in the file. There must"
+      echo "       be at least one COMMAND: specified."
+      FAILURE=YES
+   fi
+
+   # Check for duplicate lines - LDAP ADD will fail even on arbitrary fields
+   # If the same value is specified more than once for any attribute
+   if [[ -n `cat $EDITFILE | uniq -d` ]]; then
+      echo "Error: duplicate instances of the following line detected"
+      cat $EDITFILE | uniq -d | sed 's/^/      /g'
+      FAILURE=YES
+   fi
+
+   # Now, check to see if we failed at any point
+
+   if [[ $FAILURE == YES ]]; then
+      echo ""
+      echo "Unable to apply the changes because of the errors above."
+      read -p "Enter \"e\" to edit the file, anything else to quit: " ERRORCHOICE
+      if [[ "$ERRORCHOICE" != "e" ]] && [[ "$ERRORCHOICE" != "E" ]]; then
+         /bin/rm $EDITFILE
+         exit
+      fi
+   else
+      VERIFIED=TRUE
+   fi
+
+done
+
+echo "Verification passed.  Applying update."
+
+# Build our LDIF based on the new information, we'll be replacing the values
+# with whatever was read in from the edited file
+
+# Specify the DN of the SUDO role to be edited and specify that we're modifying it
+
+
+echo "dn: $SRTBEDN" > $LDIF_TMP
+echo "changetype: modify" >> $LDIF_TMP
+
+# Update users
+if [[ -n `grep -i ^sudoUser $LDIF_IN_TMP` ]]; then
+   echo "delete: sudoUser" >> $LDIF_TMP
+   echo "-" >> $LDIF_TMP
+fi
+echo "add: sudoUser" >> $LDIF_TMP
+for SU in `echo $SUS | sed 's/,/ /g'`; do
+   echo "sudoUser: +$SU" >> $LDIF_TMP
+done
+echo "-" >> $LDIF_TMP 
+
+# Update hosts
+if [[ -n `grep -i ^sudoHost $LDIF_IN_TMP` ]]; then
+   echo "delete: sudoHost" >> $LDIF_TMP
+   echo "-" >> $LDIF_TMP
+fi
+echo "add: sudoHost" >> $LDIF_TMP
+for SH in `echo $SHS | sed 's/,/ /g'`; do
+   if [[ $SH == ALL ]]; then
+      echo "sudoHost: $SH" >> $LDIF_TMP
+   else
+      echo "sudoHost: +$SH" >> $LDIF_TMP
+   fi
+done
+echo "-" >> $LDIF_TMP
+
+# Update commands
+if [[ -n `grep -i ^sudoCommand $LDIF_IN_TMP` ]]; then
+   echo "delete: sudoCommand" >> $LDIF_TMP
+   echo "-" >> $LDIF_TMP
+fi
+echo "add: sudoCommand" >> $LDIF_TMP
+grep "^COMMAND:" $EDITFILE | sed 's/^COMMAND:/sudoCommand:/g' >> $LDIF_TMP
+echo "-" >> $LDIF_TMP
+
+# Update options
+if [[ -n `grep -i ^sudoOption $LDIF_IN_TMP` ]]; then
+   echo "delete: sudoOption" >> $LDIF_TMP
+   echo "-" >> $LDIF_TMP
+fi
+echo "add: sudoOption" >> $LDIF_TMP
+if [[ $SPR == NO ]]; then
+   echo 'sudoOption: !authenticate' >> $LDIF_TMP
+else
+   echo 'sudoOption: authenticate' >> $LDIF_TMP
+fi
+if [[ -n `grep "^OPTION:" $EDITFILE` ]]; then
+   grep "^OPTION:" $EDITFILE | sed 's/^OPTION:/sudoOption:/g' >> $LDIF_TMP
+fi
+echo "-" >> $LDIF_TMP
+
+# Update Runas user
+RAU=`grep "^RUNAS:" $EDITFILE | sed 's/^RUNAS: //; s/^RUNAS://'`
+if [[ -n `grep -i ^sudoRunAsUser $LDIF_IN_TMP` ]]; then
+   echo "delete: sudoRunAsUser" >> $LDIF_TMP
+   echo "-" >> $LDIF_TMP
+fi
+if [[ -n $RAU ]]; then
+   echo "add: sudoRunAsUser" >> $LDIF_TMP
+   echo "sudoRunAsUser: $RAU" >> $LDIF_TMP
+   echo "-" >> $LDIF_TMP
+fi
+
+
+# Update description
+if [[ -n `grep -i ^description $LDIF_IN_TMP` ]]; then
+   echo "delete: Description" >> $LDIF_TMP
+   echo "-" >> $LDIF_TMP
+fi
+ODESC=`grep "^DESCRIPTION:" $EDITFILE | sed 's/^DESCRIPTION://; s/^ //;'`
+if [[ -n $ODESC ]]; then
+   echo "add: Description" >> $LDIF_TMP
+   echo "Description: $ODESC" >> $LDIF_TMP
+fi
+
+# Create a backup of the role
+if [[ ! -d $BACKUP_DIR ]]; then
+   mkdir -p $BACKUP_DIR
+fi
+LDIF_BAK=${BACKUP_DIR}/sudo_role_edited_${SRTBE}_${TS}.ldif
+
+echo "## Script Name: $0" > $LDIF_BAK
+echo "## Executed By/From: `/usr/bin/who -m`" >> $LDIF_BAK
+echo "##" >> $LDIF_BAK
+echo "## Object Before Modification:" >> $LDIF_BAK
+
+$LDAP_SEARCH -b $SUDO_BASE "(cn=${SRTBE})" 2>&1 | egrep -v '^#|^$|^search|^result' > $LDIF_BAK
+if [[ ! -s $LDIF_BAK ]]; then
+   echo "Error: there was a problem creating a backup of $SRTBE"
+   exit
+#else
+#   echo "Backup created: $LDIF_BAK"
+fi
+
+
+echo "## Attempted Modification:" >> $LDIF_BAK
+echo "##" >> $LDIF_BAK
+cat $LDIF_TMP | sed 's/^/#/g' >> $LDIF_BAK
+
+# Verify LDAP password
+VP=FALSE
+TRIES=0
+while [[ $VP == FALSE ]] && [[ $TRIES -le $MAXTRIES ]]; do
+   read -sp "LDAP Password ($UPDATE_USER): " UUP
+   echo "$LDAP_BT \"$UUP\"" | /bin/bash 2>&1 >/dev/null
+   if [[ $? != 0 ]]; then
+      unset UUP
+      let TRIES=$TRIES+1
+   else
+      echo ""
+      VP=TRUE
+   fi
+done
+   
+   
+echo "$LDAP_MODIFY -w \"$UUP\" -a -f $LDIF_TMP " | /bin/bash
+if [[ $? != 0 ]]; then
+   echo "There was an error adding the object(s)"
+   echo "The command that failed was:"
+   echo "   $LDAP_MODIFY -W -a -f $LDIF_TMP"
+   echo ""
+   echo "## Update failed" >> $LDIF_BAK
+   exit
+fi
+echo "## Update succeeded" >> $LDIF_BAK
+/bin/rm $LDIF_TMP
+
+exit
+echo "Updated $SRTBE:"
+$LDAP_SEARCH -b $SUDO_BASE "(cn=${SRTBE})" 2>&1 | egrep -v '^#|^$|^search|^result'
+

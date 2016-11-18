@@ -1,0 +1,248 @@
+#!/bin/bash
+
+###########################################
+# Purpose: Find remnants of deleted users and clean them up
+# Author: SDW
+# Incept 03/26/2013
+
+# Notes: - basic LDAP authentication must already be configured and working
+#          on the server where this script is run from
+f_Usage () {
+   echo "$0 USAGE"
+   echo ""
+   echo "$0 [-r]"
+   echo ""
+   echo "   Finds remnants of deleted user accounts in the directory, and"
+   echo "   prompts to remove them."
+   echo ""
+   echo "   -r indicates \"report-only\" mode, suitable for generating"
+   echo "      output without actually trying to alter the directory."
+   echo ""
+}
+
+# Set path to the location of the script no matter how it was invoked
+if [[ `echo $0 | sed 's/^.\///g'` == `basename $0` ]]; then
+   WORKDIR=`pwd`
+else
+   BASENAME=`basename $0`
+   WORKDIR=`echo $0 | sed 's/'"$BASENAME"'$//g'`
+fi
+
+cd $WORKDIR
+
+MODE=RW
+if [[ -n "$1" ]]; then
+   if [[ "$1" == "-r" ]]; then
+      MODE=RO
+   else
+      f_Usage
+      exit
+   fi
+fi
+
+# Set some basic options for ldap searching, durrently the directory server doesn't require a binddn or a rootbinddn
+# so simple authentication should work fine
+LDAP_SEARCH="/usr/bin/ldapsearch -x -ZZ"
+UPDATE_USER=`ldapsearch -x -ZZ "(uid=$USER)" dn | grep ^dn: | sed 's/^dn:[ \t]//'`
+LDAP_MODIFY="/usr/bin/ldapmodify -x -ZZ -D \"$UPDATE_USER\""
+LDAP_BT="$LDAP_SEARCH '(ou=SUDOers)' -D \"$UPDATE_USER\" -w"
+MAXTRIES=5
+
+# Define variables
+LDIF_TMP=/eit/admin/scripts/ldap_tools/tmp/.`basename $0`.$$.ldt
+TS=`date +%Y%m%d%H%M%S`
+BACKUP_DIR=/eit/admin/scripts/ldap_tools/local_backup
+
+
+# find the ldap base
+if [[ -s /etc/ldap.conf ]]; then
+   LDC=/etc/ldap.conf
+elif [[ -s /etc/openldap/ldap.conf ]]; then
+   LDC=/etc/openldap/ldap.conf
+fi
+LDAP_BASE=`egrep -i "^base[ \t]" $LDC | sed 's/^base[ \t]//i'`
+
+if [[ -z $LDAP_BASE ]]; then 
+   echo "Unable to find the base dn for LDAP - please make sure ldap is properly"
+   echo "configured on this machine.  If it IS properly configured and you're"
+   echo "still getting this error, you probably need to update the LDAP_SEARCH"
+   echo "variable in this script to something that works with the current config."
+   exit
+fi
+
+NG_BASE=`$LDAP_SEARCH '(ou=Netgroups)' | sed ':a;N;$!ba;s/\n //g' | grep "dn: ou" | awk '{print $2}'`
+PG_BASE=`$LDAP_SEARCH '(ou=Groups)' | sed ':a;N;$!ba;s/\n //g' | grep "dn: ou" | awk '{print $2}'`
+
+# Generate a list of current valid user IDs and their DN's
+
+VULIST=`$LDAP_SEARCH -b $LDAP_BASE '(uid=*)' uid | sed ':a;N;$!ba;s/\n //g' | grep ^uid: | sed 's/^uid:[\t ]//g'`
+VULIST="$VULIST `cat ndse.dat`"
+VUDNLIST=`$LDAP_SEARCH -b $LDAP_BASE '(uid=*)' dn | sed ':a;N;$!ba;s/\n //g' | grep ^dn: | sed 's/^dn:[\t ]//g'`
+VUDNLIST="$VUDNLIST `cat ndse.dat | sed 's/^/uid=/g;s/$/,ou=ServiceAccounts,dc=ds,dc=west,dc=com/g'`"
+
+
+# List all  POSIX groups with members
+
+#memberuid version
+PGLIST=`$LDAP_SEARCH -b $PG_BASE '(memberuid=*)' cn | sed ':a;N;$!ba;s/\n //g' | grep ^cn: | sed 's/^cn:[\t ]//g'`
+
+if [[ $MODE == RW ]]; then echo "Checking for remnants, this may take a while..."; fi
+
+for PG in $PGLIST; do
+   # Get a list of each group's members 
+   unset ML
+   ML=`$LDAP_SEARCH -b $PG_BASE "(cn=$PG)" memberuid | sed ':a;N;$!ba;s/\n //g' | grep ^memberuid: | sed 's/^memberuid:[\t ]//g'`
+   PGDN=`$LDAP_SEARCH -b $PG_BASE "(cn=$PG)" dn | sed ':a;N;$!ba;s/\n //g' | grep ^dn: | sed 's/^dn:[\t ]//g'`
+
+   # look at every member in the members list
+   for M in $ML; do
+      # start with the assumption that the posix group member is not valid
+      PGMV=FALSE
+
+      # compare each member to the list of valid users
+      for VU in $VULIST; do
+
+         # if we get a match then the user is valid
+         if [[ "$M" == "$VU" ]]; then
+            PGMV=TRUE
+         fi
+      done
+
+      # if we did NOT get a match then we need to pipe a remove directive into our ldif 
+      if [[ $PGMV != TRUE ]]; then
+         if [[ $MODE == RW ]]; then
+            echo "dn: $PGDN" >> $LDIF_TMP
+            echo "changetype: modify" >> $LDIF_TMP
+            echo "delete: memberUID" >> $LDIF_TMP
+            echo "memberUID: $M" >> $LDIF_TMP
+            echo "-" >> $LDIF_TMP
+            echo "" >> $LDIF_TMP
+         fi
+         echo "Remnant $M found in posix group $PG"
+      fi
+   done
+done
+
+#uniquemember version
+PGLIST=`$LDAP_SEARCH -b $PG_BASE '(uniquemember=*)' cn | sed ':a;N;$!ba;s/\n //g' | grep ^cn: | sed 's/^cn:[\t ]//g'`
+
+for PG in $PGLIST; do
+   # Get a list of each group's members
+   unset ML
+   ML=`$LDAP_SEARCH -b $PG_BASE "(cn=$PG)" uniquemember | sed ':a;N;$!ba;s/\n //g' | grep ^uniquemember: | sed 's/^uniquemember:[\t ]//g'`
+   PGDN=`$LDAP_SEARCH -b $PG_BASE "(cn=$PG)" dn | sed ':a;N;$!ba;s/\n //g' | grep ^dn: | sed 's/^dn:[\t ]//g'`
+
+   # look at every member in the members list
+   for M in $ML; do
+
+      # start with the assumption that the posix group member is not valid
+      PGMV=FALSE
+
+      # compare each member to the list of valid users
+      # Note: I haven't added handling for dn's with spaces in them!
+      for VUDN in $VUDNLIST; do
+        
+         # if we get a match then the user is valid
+         if [[ "$M" == "$VUDN" ]]; then
+            PGMV=TRUE
+         fi
+      done
+
+      # if we did NOT get a match then we need to pipe a remove directive into our ldif
+      if [[ $PGMV != TRUE ]]; then
+         if [[ $MODE == RW ]]; then
+            echo "dn: $PGDN" >> $LDIF_TMP
+            echo "changetype: modify" >> $LDIF_TMP
+            echo "delete: uniquemember" >> $LDIF_TMP
+            echo "uniquemember: $M" >> $LDIF_TMP
+            echo "-" >> $LDIF_TMP
+            echo "" >> $LDIF_TMP
+         fi
+         echo "Remnant $M found in posix group $PG"
+      fi
+   done
+done
+
+# Check netgroups
+# list all netgroups with users as members
+NGLIST=`$LDAP_SEARCH -b $NG_BASE "(nisnetgrouptriple=\(-,*,\))" cn | sed ':a;N;$!ba;s/\n //g' | grep ^cn: | sed 's/^cn:[\t ]//g'`
+
+for NG in $NGLIST; do
+   # Get a list of each netgroup's userID members
+   unset ML
+   ML=`$LDAP_SEARCH -b $NG_BASE "(&(cn=$NG)(nisnetgrouptriple=\(-,*,\)))" nisnetgrouptriple | sed ':a;N;$!ba;s/\n //g' | grep ^nisnetgrouptriple: | sed 's/^nisnetgrouptriple:[\t ]//g' | awk -F',' '{print $2}'`
+   NGDN=`$LDAP_SEARCH -b $NG_BASE "(cn=$NG)" dn | sed ':a;N;$!ba;s/\n //g' | grep ^dn: | sed 's/^dn:[\t ]//g'`
+
+   # look at every member in the members list
+   for M in $ML; do
+      # start with the assumption that the posix group member is not valid
+      NGMV=FALSE
+
+      # compare each member to the list of valid users
+      for VU in $VULIST; do
+
+         # if we get a match then the user is valid
+         if [[ "$M" == "$VU" ]]; then
+            NGMV=TRUE
+         fi
+      done
+
+      # if we did NOT get a match then we need to pipe a remove directive into our ldif
+      if [[ $NGMV != TRUE ]]; then
+         if [[ $MODE == RW ]]; then
+            echo "dn: $NGDN" >> $LDIF_TMP
+            echo "changetype: modify" >> $LDIF_TMP
+            echo "delete: nisnetgrouptriple" >> $LDIF_TMP
+            echo "nisnetgrouptriple: (-,$M,)" >> $LDIF_TMP
+            echo "-" >> $LDIF_TMP
+            echo "" >> $LDIF_TMP
+         fi
+         echo "Remnant $M found in netgroup $NG"
+      fi
+   done
+done
+
+# Exit on empty LDIF_TMP
+
+if [[ ! -s $LDIF_TMP ]]; then
+   if [[ $MODE == RW ]]; then echo "No remnants found."; fi
+   exit
+fi
+
+# Ask for confirmation
+echo ""
+echo "Please review the list of remnants to be removed before continuing."
+echo ""
+read -p "Okay to continue? (Enter Y to delete remnants, anything else to quit): " CONFIRM
+if [[ -z `echo $CONFIRM | grep -i "^Y$"` ]]; then
+   echo "Action Cancelled."
+else
+
+   # Verify LDAP password
+   VP=FALSE
+   TRIES=0
+   while [[ $VP == FALSE ]] && [[ $TRIES -le $MAXTRIES ]]; do
+      read -sp "LDAP Password ($UPDATE_USER): " UUP
+      echo "$LDAP_BT \"$UUP\"" | /bin/bash 2>&1 >/dev/null
+      if [[ $? != 0 ]]; then
+         unset UUP
+         let TRIES=$TRIES+1
+      else
+         echo ""
+         VP=TRUE
+      fi
+   done
+
+
+   echo "$LDAP_MODIFY -w \"$UUP\" -a -f $LDIF_TMP " | /bin/bash
+   if [[ $? != 0 ]]; then
+      echo "There was an error adding the object(s)"
+      echo "The command that failed was:"
+      echo "   $LDAP_MODIFY -W -a -f $LDIF_TMP"
+      echo ""
+      exit
+   fi
+fi
+/bin/rm $LDIF_TMP
+
+

@@ -1,0 +1,248 @@
+#!/bin/bash 
+
+###########################################
+# Purpose: Check the lock status of a user account
+# Author: SDW
+# Incept 01/30/2013
+
+# Notes: - basic LDAP authentication must already be configured and working
+#          on the server where this script is run from
+f_Usage () {
+   echo "$0 USAGE"
+   echo ""
+   echo "$0 <user name>"
+   echo ""
+   echo "   Checks to see if a user account is locked, how many bad attempts"
+   echo "   were made and when the account will unlock itself."
+   echo ""
+   echo ""
+}
+
+#############################################
+# f_FormatDate()
+# Purpose: change LDAP date format to more familiar
+#          format
+#
+# Usage: f_FormatDate <DATESTRING>
+#
+# Where <DATESTRING> is in format YYYYMMDDHHMMSSZ
+
+f_FormatDate() {
+
+   # 20130130193715Z
+   # Times given will be in Zulu
+
+
+   DS=$1
+
+   # Determine time difference from zulu
+   #let DIFF=`date +%H`-`date -u +%H`
+   let DIFF="`date +%k`-`date -u +%k`"
+
+   # Separate the given date string into its components
+   YYYY=`echo $DS | cut -c 1-4`
+   NM=`echo $DS | cut -c 5-6`
+   ND=`echo $DS | cut -c 7-8`
+   ZH=`echo $DS | cut -c 9-10`
+   MM=`echo $DS | cut -c 11-12`
+   SS=`echo $DS | cut -c 13-14`
+
+   let LH=$ZH+$DIFF
+   # If the resulting "local hour" is less than zero, then we 
+   # need to subtract it from 24 and decriment the date by 1
+   if [[ $LH -lt 0 ]]; then
+      let LH=24+$LH
+      let ND=$ND-1
+   # If the resulting "local hour" is greater than 23 then
+   # we need to subtract it from 24 and increment the date by 1
+   elif [[ $LH -gt 23 ]]; then
+      let LH=$LH-24
+      let ND=$ND+1
+   fi
+
+   # Set the local 12-hour hour and period
+   if [[ $LH -eq 12 ]]; then
+      PERIOD=PM
+      LH12=$LH
+   elif [[ $LH -gt 12 ]]; then
+      PERIOD=PM
+      let LH12=$LH-12
+   elif [[ $LH -eq 0 ]]; then
+      PERIOD=AM
+      LH12=12
+   else
+      PERIOD=AM
+      LH12=$LH
+   fi
+   
+
+   case $NM in
+
+      01) AD=January
+          ADA=Jan
+          ;;
+      02) AD=February
+          ADA=Feb
+          ;;
+      03) AD=March
+          ADA=Mar
+          ;;
+      04) AD=April
+          ADA=Apr
+          ;;
+      05) AD=May
+          ADA=May
+          ;;
+      06) AD=June
+          ADA=Jun
+          ;;
+      07) AD=July
+          ADA=Jul
+          ;;
+      08) AD=August
+          ADA=Aug
+          ;;
+      09) AD=September
+          ADA=Sep
+          ;;
+      10) AD=October
+          ADA=Oct
+          ;;
+      11) AD=November
+          ADA=Nov
+          ;;
+      12) AD=December
+          ADA=Dec
+          ;;
+       *) AD=Error
+          ADA=Err
+          ;;
+   esac
+
+   #echo "$AD $ND ${LH12}:${MM}:${SS} $PERIOD"
+   echo "${NM}/${ND}/${YYYY} ${LH12}:${MM}:${SS} $PERIOD"
+  
+
+}
+
+
+# Set path to the location of the script no matter how it was invoked
+if [[ `echo $0 | sed 's/^.\///g'` == `basename $0` ]]; then
+   WORKDIR=`pwd`
+else
+   BASENAME=`basename $0`
+   WORKDIR=`echo $0 | sed 's/'"$BASENAME"'$//g'`
+fi
+
+cd $WORKDIR
+
+# Set some basic options for ldap searching, durrently the directory server doesn't require a binddn or a rootbinddn
+# so simple authentication should work fine
+LDAP_SEARCH="/usr/bin/ldapsearch -x -ZZ"
+
+# find the ldap base
+if [[ -s /etc/ldap.conf ]]; then
+   LDC=/etc/ldap.conf
+elif [[ -s /etc/openldap/ldap.conf ]]; then
+   LDC=/etc/openldap/ldap.conf
+fi
+LDAP_BASE=`egrep -i "^base[ \t]" $LDC | sed 's/^base[ \t]//i'`
+
+if [[ -z $LDAP_BASE ]]; then 
+   echo "Unable to find the base dn for LDAP - please make sure ldap is properly"
+   echo "configured on this machine.  If it IS properly configured and you're"
+   echo "still getting this error, you probably need to update the LDAP_SEARCH"
+   echo "variable in this script to something that works with the current config."
+   exit
+fi
+
+
+
+# Get information from the user
+
+UTBQ=$1
+
+# If we got a name from the command line
+if [[ -n $UTBQ ]]; then
+
+   if [[ "$UTBQ" == "--help" ]]; then
+      f_Usage
+      exit
+   fi
+   # Verify the netgroup exists
+   if [[ -z `$LDAP_SEARCH -b $LDAP_BASE "(uid=${UTBQ})" uid | grep ^uid:` ]]; then
+      echo "ERROR: user \"$UTBQ\" not found in the directory."
+      exit
+   else
+      UTBQDN=`$LDAP_SEARCH -b $LDAP_BASE "(uid=${UTBQ})" dn | sed ':a;N;$!ba;s/\n //g' | grep ^dn: | sed 's/^dn: //g'`
+   fi
+
+# If we did NOT get a name from the command line 
+else 
+
+   # Prompt the user for a name
+   VC2=FALSE
+   while [[ $VC2 == FALSE ]]; do
+      unset GUTBQ
+      read -p "What is the name of the user to be checked?: " GUTBQ
+
+      # Check for non-existence - retry on error
+      if [[ -z `$LDAP_SEARCH -b ou=People,$LDAP_BASE "(uid=${GUTBQ})" uid | grep ^uid:` ]]; then
+         echo "ERROR: user \"$GUTBQ\" not found in the directory."
+         read -p "Press Enter to try a different name, Ctrl+C to cancel." JUNK
+         tput uu1; tput el; tput uu1; tput el; tput uu1; tput el
+      else
+         VC2=TRUE
+         UTBQ=$GUTBQ
+      fi
+   done
+fi
+
+# Get status information from the user account
+RETRYCOUNT=`$LDAP_SEARCH -b $LDAP_BASE "(&(objectclass=posixaccount)(uid=${UTBQ}))" passwordretrycount | sed ':a;N;$!ba;s/\n //g' | grep ^passwordretrycount: | awk '{print $2}'`
+RESETTIME=`$LDAP_SEARCH -b $LDAP_BASE "(&(objectclass=posixaccount)(uid=${UTBQ}))" retrycountresettime| sed ':a;N;$!ba;s/\n //g' | grep ^retrycountresettime: | awk '{print $2}'`
+UNLOCKTIME=`$LDAP_SEARCH -b $LDAP_BASE "(&(objectclass=posixaccount)(uid=${UTBQ}))" accountunlocktime | sed ':a;N;$!ba;s/\n //g' | grep ^accountunlocktime: | awk '{print $2}'`
+EXPIRES=`$LDAP_SEARCH -b $LDAP_BASE "(&(objectclass=posixaccount)(uid=${UTBQ}))" passwordexpirationtime | sed ':a;N;$!ba;s/\n //g' | grep ^passwordexpirationtime: | awk '{print $2}'`
+
+# Set the present time in seconds since Epoc
+NOW=`date +%s`
+
+# Convert times on account to seconds since EPOC
+if [[ -n $UNLOCKTIME ]]; then
+   UTSTRING=`f_FormatDate $UNLOCKTIME`
+   UT=`date -d "$UTSTRING" +%s`
+fi
+if [[ -n $RESETTIME ]]; then
+   RTSTRING=`f_FormatDate $RESETTIME`
+   RT=`date -d "$RTSTRING" +%s`
+fi
+
+#echo "NOW is $NOW"
+#echo "Unlock time is: $UT"
+#echo "Reset Count time is: $RT"
+
+
+echo "Status for user ${UTBQ}:"
+if [[ -n $EXPIRES ]]; then
+   echo "   Password Expires: `f_FormatDate $EXPIRES` `date +%Z`"
+else
+   echo "   Password Expires: Does Not Expire"
+fi
+echo -n "   Lock Status: "
+if [[ -z $UNLOCKTIME ]] || [[ $UT -le $NOW  ]]; then
+   echo "unlocked"
+   if [[ $RETRYCOUNT != 0 ]]; then
+      if [[ $RT -gt $NOW ]]; then
+         echo "   Bad Password Attempts: $RETRYCOUNT"
+         echo "   Count Will Reset At: `f_FormatDate $RESETTIME` `date +%Z`"
+      else
+         echo "   Bad Password Attempts: 0"
+      fi
+   fi
+   
+else
+   echo "locked"
+   echo "   Will Automatically Unlock: `f_FormatDate $UNLOCKTIME` `date +%Z`"
+fi
+
+

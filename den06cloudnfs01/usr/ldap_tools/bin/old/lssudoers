@@ -1,0 +1,319 @@
+#!/bin/bash
+
+###########################################
+# Purpose: list netgroups, members etc...
+# Author: SDW
+# Incept 08/08/2012
+
+# Notes: - basic LDAP authentication must already be configured and working
+#          on the server where this script is run from
+
+f_Usage () {
+   echo "lssudoers USAGE"
+   echo ""
+   echo "   lssudoers -L"
+   echo ""
+   echo "      OR"
+   echo ""
+   echo "   lssudoers [-R|-u|-h] <SUDOrole>"
+   echo ""
+   echo "      OR"
+   echo ""
+   echo "   lssudoers -s <user>"
+   echo ""
+   echo "      OR"
+   echo ""
+   echo "   lssudoers -H <host>"
+   echo ""
+   echo "      OR"
+   echo ""
+   echo "   lssudoers -C <command>"
+   echo ""
+   echo "      -l   List All SUDO roles"
+   echo ""
+   echo "      -L   List All SUDO roles with descriptions"
+   echo ""
+   echo "      -R   Print full details of <SUDOrole>"
+   echo ""
+   echo "      -u   Print all users who can execute <SUDOrole>"
+   echo ""
+   echo "      -h   Print all hosts where <SUDOrole> can be executed"
+   echo ""
+   echo "      -s   Print all roles that can be executed by <user>."
+   echo "           <user> may be a single user name or a user netgroup."
+   echo ""
+   echo "      -H   Print any SUDOroles possible on <host>. (not qualified by user)"
+   echo ""
+   echo "      -C   List SUDOroles containing the exact <command>. "
+   echo ""
+   echo "      -CC  List SUDOroles with command containing <string>. "
+   echo ""
+
+}
+
+# Set path to the location of the script no matter how it was invoked
+if [[ `echo $0 | sed 's/^.\///g'` == `basename $0` ]]; then
+   WORKDIR=`pwd`
+else
+   BASENAME=`basename $0`
+   WORKDIR=`echo $0 | sed 's/'"$BASENAME"'$//g'`
+fi
+
+cd $WORKDIR
+
+
+# Set some basic options for ldap searching, durrently the directory server doesn't require a binddn or a rootbinddn
+# so simple authentication should work fine
+LDAP_SEARCH="/usr/bin/ldapsearch -x -LL -ZZ"
+LSNETGROUP="./lsnetgroup"
+
+# Temporary storage file
+LSSTEMP=/tmp/lssudo.$$.tmp
+
+# find the ldap base
+if [[ -s /etc/ldap.conf ]]; then
+   LDC=/etc/ldap.conf
+elif [[ -s /etc/openldap/ldap.conf ]]; then
+   LDC=/etc/openldap/ldap.conf
+fi
+LDAP_BASE=`egrep -i "^base[ \t]" $LDC | sed 's/^base[ \t]//i'`
+
+if [[ -z $LDAP_BASE ]]; then 
+   echo "Unable to find the base dn for LDAP - please make sure ldap is properly"
+   echo "configured on this machine.  If it IS properly configured and you're"
+   echo "still getting this error, you probably need to update the LDAP_SEARCH"
+   echo "variable in this script to something that works with the current config."
+   exit
+fi
+
+# set some base dn's
+
+NG_BASE=`$LDAP_SEARCH '(ou=Netgroups)' dn | grep "dn: ou" | awk '{print $2}'`
+SUDO_BASE=`$LDAP_SEARCH '(ou=SUDOers)' dn | grep "dn: ou" | awk '{print $2}'`
+
+# If there is no Netgroups OU then print an error and exit
+if [[ -z $NG_BASE ]]; then 
+  echo "No Netgroup OU was found at $LDAP_BASE..."
+  echo "Please run the appropriate script from directory-setup"
+  echo "and try again."
+  exit
+fi
+
+# If there is no SUDOers OU then print an error and exit
+if [[ -z $SUDO_BASE ]]; then
+  echo "No SUDOers OU was found at $LDAP_BASE..."
+  echo "Please run the appropriate script from directory-setup"
+  echo "and try again."
+  exit
+fi
+
+# First check to see if we're trying to do a command search
+if [[ -n $1 ]] && ( [[ $1 == -C ]] || [[ $1 == -CC ]] ); then
+
+   # Search for exact command
+   if [[ $1 == -C ]]; then
+
+      # Pull the command string out of the arguments list
+      CS=`echo $@ | sed 's/^-C //'`
+
+      # Print header
+      echo "Roles With Exact Command [${CS}]"
+      echo "Note: may not find commands which are base64 encoded"
+
+      # Perform plaintext LDAP search
+      $LDAP_SEARCH -b $SUDO_BASE "(&(objectclass=sudorole)(sudocommand=${CS}))" cn sudocommand 2>&1 | sed -e 's/^sudocommand://g;s/^cn: /\n/g' | egrep -v '^dn:' | egrep "^$|_role|${CS}"
+     
+      # Perform a search of base64-encoded commands
+   fi
+  
+   # Search for command containing
+   if [[ $1 == -CC ]]; then
+
+      # Pull the search string out of the arguments list
+      CS=`echo $@ | sed 's/^-CC //'`
+
+      # Print header
+      echo "Roles With Command(s) Containing [${CS}]"
+      echo "Note: may not find commands which are base64 encoded"
+
+      # Perform plaintext LDAP search
+      $LDAP_SEARCH -b $SUDO_BASE "(&(objectclass=sudorole)(sudocommand=*${CS}*))" cn sudocommand 2>&1 | sed -e 's/^sudocommand://g;s/^cn: /\n/g' | egrep -v '^dn:' | egrep "^$|_role|${CS}"
+   fi
+
+
+
+# if we only got one argument
+elif [[ $# == 1 ]]; then
+   if [[ "$1" == "-l" ]]; then
+      $LDAP_SEARCH -b $SUDO_BASE "(objectClass=sudorole)" cn | grep ^cn: | sed 's/^cn:[ \t]//g' | grep -v ^defaults | sort
+   elif [[ "$1" == "-L" ]]; then
+      ldapsearch -x -LL '(objectclass=sudorole)' cn description | sed ':a;N;$!ba;s/\n //g' | egrep '^cn:|^description:' | sed ':a;N;$!ba;s/\ndescription:/@#@/g' | sed 's/^cn: //g' >> $LSSTEMP
+      for SR in `awk -F'@#@' '{print $1}' $LSSTEMP | egrep -v ^defaults`; do
+         DESC=`grep "^${SR}@#@" $LSSTEMP | awk -F'@#@' '{print $2}'`
+
+         if [[ -n `echo $DESC | grep ^:` ]]; then
+            DDESC=`echo $DESC | sed 's/^://' | perl -MMIME::Base64 -0777 -ne 'print decode_base64($_)'`
+            DESC=$DDESC
+         fi
+         if [[ -n $DESC ]]; then
+            echo "$SR ($DESC )"
+         else
+            echo "$SR"
+         fi
+ 
+      done
+      /bin/rm $LSSTEMP
+
+   else
+      f_Usage
+      exit
+   fi
+# if we got more than one argument
+elif [[ $# == 2 ]]; then
+
+   MODE=$1
+   SS=$2
+   
+   # Make sure the sudo role actually exists
+   if [[ -n `$LDAP_SEARCH -b $SUDO_BASE "(cn=${SS})" cn | egrep ^cn:` ]] || [[ -n `echo $MODE | egrep "^-s|^-H"` ]]; then
+
+
+      if [[ "$MODE" == "-R" ]]; then
+         # List full details of a given sudoers role
+         echo "" 
+         $LDAP_SEARCH -b $SUDO_BASE "(cn=${SS})" | sed ':a;N;$!ba;s/\n //g' | egrep -v '^#|^$|^search|^result' | egrep -i -v '^dn:|^objectClass:' | sort -k1 | sed 's/description:/Description:/I; s/^cn:/Name:/; s/sudoCommand:/Command:/gI; s/sudoUser:/User_Netgroup:/gI; s/+//g; s/sudoHost:/Host_Netgroup:/gI; s/sudoOption: authenticate/Ask_Password: YES/I; s/sudoOption: !authenticate/Ask_Password: NO/I'
+         echo ""
+
+      elif [[ "$MODE" == "-d" ]]; then
+      # Show the description for the given sudo role
+         DSTRING=`$LDAP_SEARCH -b $SUDO_BASE "(cn=${SR})" description | egrep -v '^dn:|^#|^$|^search:|^result:' | sed 's/^ //g' | sed ':a;N;$!ba;s/\n //g'`
+         if [[ -n `echo $DSTRING | grep -i "^description::"` ]]; then
+            BASE64DESC=`echo $DSTRING | grep -i "^description::" | sed 's/^description:://i'`
+            DESC=`echo $BASE64DESC | perl -MMIME::Base64 -0777 -ne 'print decode_base64($_)'`
+         else
+            DESC=`echo $DSTRING | grep -i "^description:" | sed 's/^description://i'`
+         fi
+         if [[ -n $DESC ]]; then
+            echo "$DESC"
+         else
+            echo "No description found for $SS."
+         fi
+
+
+      elif [[ "$MODE" == "-u" ]] || [[ "$MODE" == "-u1" ]]; then
+
+         # List all users who can execute a given sudoers command
+
+         for SUN in `$LDAP_SEARCH -b $SUDO_BASE "(cn=${SS})" sudoUser | grep -i sudoUser: | sed 's/sudoUser://gI; s/^[ \t]//g'`; do
+            NG=`echo $SUN | sed 's/^+//g'`
+            unset UL
+            UL=`$LSNETGROUP -N1 $NG`
+            AUL="$AUL $UL"
+         done
+         if [[ "$MODE" == "-u" ]]; then
+            for u in $AUL; do echo $u; done | sort -u | sed ':a;N;$!ba;s/\n/ /g'
+         else
+            for u in $AUL; do echo $u; done | sort -u
+         fi
+
+      elif [[ "$MODE" == "-s" ]] || [[ "$MODE" == "-s1" ]]; then
+
+         # List all the sudoers roles that can be executed by a given user
+
+         # Check to see if SS is a user netgroup
+
+         if [[ -n `echo $SS | grep "_users$"` ]] && [[ -n `$LDAP_SEARCH -b $NG_BASE "(cn=${SS})" cn | grep ^cn:` ]]; then
+            # Input was a netgroup, so set UNGLIST to just it.
+            UNGLIST=$SS
+         else
+            UNGLIST=`$LSNETGROUP -U1 $SS | grep _users`
+         fi
+         
+         unset SRL
+         for UNG in $UNGLIST; do
+            unset TSRL
+            TSRL=`$LDAP_SEARCH -b $SUDO_BASE "(sudoUser=+${UNG})" cn | grep ^cn: | sed 's/cn://g'`
+            SRL="$SRL $TSRL"
+         done
+         if [[ "$MODE" == "-s" ]]; then
+            for s in $SRL; do echo $s; done | sort -u | sed ':a;N;$!ba;s/\n/ /g'
+         else
+            for s in $SRL; do echo $s; done | sort -u
+         fi
+
+
+      elif [[ "$MODE" == "-h" ]] || [[ "$MODE" == "-h1" ]]; then
+
+      # List all hosts where a given SUDO role is valid
+
+      # Make sure the sudo role actually exists
+         unset AHL
+         unset NG
+         if [[ -n `$LDAP_SEARCH -b $SUDO_BASE "(cn=${SS})" sudoHost | grep -i ^sudoHost: | grep -i " ALL$"` ]]; then
+            AHL=ALL
+         else
+            for SHN in `$LDAP_SEARCH -b $SUDO_BASE "(cn=${SS})" sudoHost | grep -i ^sudoHost: | sed 's/sudoHost://gI; s/^[ \t]//g'`; do
+               NG=`echo $SHN | sed 's/^+//g'`
+               unset HL
+   
+               # Machine netgroups have user netgroups as members, so we need to treat them differently
+               if [[ -n `echo $SHN | grep "_machine$"` ]]; then
+                  # If we're looking at a machine netgroup, just grab the one host who's a member of the netgroup
+                  HL=`$LDAP_SEARCH -b $NG_BASE "(cn=$SHN)" nisNetgroupTriple | grep ^nisNetgroupTriple | awk -F'(' '{print $2}' | awk -F',' '{print $1}'`
+               else
+                  # If we're looking at a host netgroup, then use lsnetgroup to pull in all of the members
+                  HL=`$LSNETGROUP -N1 $NG`
+               fi
+               AHL="$AHL $HL"
+            done
+         fi
+         if [[ "$MODE" == "-h" ]]; then
+            for h in $AHL; do echo $h; done | sort -u | sed ':a;N;$!ba;s/\n/ /g'
+         else
+            for h in $AHL; do echo $h; done | sort -u
+         fi
+      elif [[ "$MODE" == "-H" ]] || [[ "$MODE" == "-H1" ]]; then
+         # List all SUDO roles that can be executed on a given host (regardless of user)
+         
+         # get a list of all host netgroups the host is a member of
+         NGL=`$LSNETGROUP -H1 $SS`
+
+         # get a list of all sudoRoles with "ALL" as a sudoHost
+         ARL=`$LDAP_SEARCH -b $SUDO_BASE '(sudoHost=ALL)' cn | grep ^cn: | sed 's/cn:[\t ]//g' | egrep -v '^defaults$'`
+
+         # get a list of all sudoRoles with netgroups from NGL as a sudoHost
+         unset HRL
+         for HNG in $NGL; do
+            unset HRTNG
+            HRTNG=`$LDAP_SEARCH -b $SUDO_BASE "(sudoHost=+$HNG)" cn | grep ^cn: | sed 's/cn:[\t ]//g' | egrep -v '^defaults$'`
+            HRL="$HRL $HRTNG"
+         done
+
+         #Combine the ALL hosts roles with the roles for this host
+         RL="$ARL $HRL"         
+
+         #Format output
+         FRL=`for R in $RL; do echo $R; done | sort -u`
+         if [[ "$MODE" == "-H" ]]; then
+            for FR in $FRL; do
+               echo -n "$FR "
+            done
+            echo -en "\n"
+         else
+            echo "$FRL"
+         fi
+
+      else
+         echo "Option \"$MODE\" not recognized."
+         f_Usage
+      fi
+   
+   else
+      echo "SUDO role \"$SS\" not found in the directory."
+   fi
+else
+   f_Usage
+   
+fi
+
+

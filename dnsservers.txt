@@ -1,0 +1,11 @@
+# Primary DNS Servers
+#p mdns20.svc.west.com 10.70.1.148
+#p mdns21.svc.west.com 10.65.116.125
+
+# Site-Specific DNS Servers
+s den06dns10.svc.west.com 10.70.1.60
+s den06dns11.svc.west.com 10.70.1.61
+s swn01dns10.svc.west.com 10.64.10.152
+s swn01dns11.svc.west.com 10.64.10.153
+s lon13dns01.svc.west.com 10.166.128.52
+s lon13dns02.svc.west.com 10.166.128.53

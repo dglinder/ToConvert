@@ -1,0 +1,340 @@
+#############################################
+# Purpose: RHEL template update playbook
+# Author: DGL
+# Revision: $Rev$
+# Updated by: $Author$
+# Last change date: $LastChangedDate$
+# SVN URL: $HeadURL$
+# To export the latest version of this file:
+#   svn export [HeadURL]
+#############################################
+# 
+# Run from Linux1410, example:
+#   ansible-playbook -i WC_vms WC_prod_setup.yml
+# eit-rhel6-cloud-template / 10.70.96.200 / 255.255.255.0 / 00:50:56:00:fa:fb
+# eit-rhel5-cloud-template / 10.70.96.203 / 255.255.255.0 / 00:50:56:92:d1:24
+#
+# Usage:
+# + On Linux1410, in the "/home/dglinder/WestCloud_scripts" directory
+# + Verify connectivity:
+#     sudo ansible prod_templates -i ~/WestCloud_scripts/WC_vms -m ping
+# + Update systems
+#     sudo ansible-playbook -i WC_vms WC_prod_setup.yml
+# + Review output of playbook
+#
+# ToDo:
+# - task: Break up this single YML file into a proper playbook directory structure
+# - task: outside of Ansible - ensure MOTD is generated more dynamically by
+
+---
+- name: West Cloud RHEL template update playbook
+  hosts: all_templates
+  gather_facts: True
+
+  vars_prompt:
+    - name: "sat5user"
+      prompt: "Satellite 5 user account"
+      private: no
+
+    - name: "sat5pwd"
+      prompt: "Satellite 5 user password"
+      private: yes
+
+  vars:
+# Global variablebug_output: true / false
+    debug_output: false
+  
+# SYMCquiesce variables
+    package_name: SYMCquiesce
+    symc_version: '1.0.0-003'
+    symc_cache_dir: files/SYMCquiesce/
+    temp_file: "{{ temp_dir.stdout }}/{{ package_name }}.rpm"
+
+# NTP variables
+    ntp_conf_file: files/NTP/ntp.conf.j2
+
+# IPTables variabls
+    iptables_cache_dir: files/IPTables/
+    iptables_conf_file: /etc/sysconfig/iptables
+
+  tasks:
+#######################################
+# Ensure the template system is registered with West Satellite 5
+# Force an un-register and re-register to verify.
+    - name: Un-register using rhn_register
+      rhn_register: state=absent username={{sat5user}} password="{{sat5pwd}}"
+      register: unregister_rhn
+      #ignore_errors: True
+
+    - name: Register using rhn_register
+      rhn_register: state=present activationkey=1-cloud_key 
+      register: rhnresults_rhn
+
+#######################################
+# yum update
+    - name: Full system yum update using name='*'
+      yum: name=* state=latest update_cache=yes
+      register: yum_update
+      # Regsitered so the number of packages changed is available later.
+
+    - name: restart system if yum upgrade notes changes.
+      shell: sleep 2 && shutdown -r now "Ansible updates triggered"
+      async: 1
+      poll: 0
+      #become: true
+      ignore_errors: true
+      when: yum_update.changed
+
+    - name: waiting for server to come back
+      local_action: wait_for host={{ ansible_nodename }} port=22 state=started delay=20 timeout=60
+      become: false
+      when: yum_update.changed
+
+
+#######################################
+# Check for ".rpmnew" files, must handle manually
+    - name: Check for .rpmnew files, exit if any exist for manual review.
+      find: paths="/" file_type=file patterns="*.rpmnew" recurse=yes
+      register: find_result
+      when: yum_update.changed
+    - name: Handle existence of .rpmnew files.
+      fail: msg="Extra rpmnew files found - please address manually and remove before re-running playbook."
+      failed_when: (yum_update.changed) and (find_result.matched > 0)
+
+#######################################
+# Update scripts from SVN repository.
+    - name: Make temporary check-out directory
+      local_action: command mktemp -d
+      register: temp_checkout_files
+      run_once: true
+
+    - name: Checkout files locally for distribution
+      local_action: >
+        subversion
+        force=yes
+        repo=https://eitsvn.west.com/svn/EIT-post_scripts/trunk/
+        dest={{ temp_checkout_files.stdout }}/trunk
+      run_once: true
+
+    - name: Update setup_scripts in /maint/scripts/
+      copy: src="{{ temp_checkout_files.stdout }}/trunk/{{ item }}" dest="/maint/scripts/{{ item }}" backup=no mode=0755
+      with_items:
+        - common_functions.h
+        - regensso.sh
+        - rhelcloneprep.sh
+        - setup_auth.sh
+        - setup_bb.sh
+        - setup_default_accounts.sh
+        - setup_dns.sh
+        - setup_files_and_dirs.sh
+        - setup_hostname.sh
+        - setup_hw_tools.sh
+        - setup_hyperic.sh
+        - setup_ip_bonding.sh
+        - setup_iptables.sh
+        - setup_ldap.sh
+        - setup_legacy_wic.sh
+        - setup_linux.sh
+        - setup_motd.sh
+        - setup_network.sh
+        - setup_ntp.sh
+        - setup_raid_utility.sh
+        - rhelcloneprep.sh
+        - setup_rhss-autopatch.sh
+        - setup_rhss.sh
+        - setup_security.sh
+        - setup_services.sh
+        - setup_snmp.sh
+        - setup_statement_of_origin.sh
+        - westcloudprep.sh
+
+#######################################
+# Ensure the latest configure_syslog.sh and .conf files are installed.
+    - name: Ensure West SIEM line is in configure_syslog.conf
+      lineinfile: dest=/opt/configure_syslog.conf state=present line=OVR:authpriv.*,*.info:@gniggol.0.west.com:514
+    - name: Copy configure_syslog.sh from repository to server for local execution
+      copy: src="{{ temp_checkout_files.stdout }}/trunk/{{ item }}" dest="/opt/{{ item }}" backup=no mode=0755
+      with_items:
+        - configure_syslog.sh
+
+    - name: Cleanup temporary check-out directory
+      local_action: file path={{ temp_checkout_files.stdout }} state=absent
+      run_once: true
+
+#    - name: Debug exiting...
+#      fail: msg="DEBUG EXITING"
+
+#######################################
+# Update the ifcfg-e* so 'DOMAIN=' is set:
+#   DOMAIN="west.com one.west.com wic.west.com corp.westworlds.com svc.west.com icallinc.com us.intercall.com"
+# Idea from: https://u.osu.edu/hasnan.1/2013/12/11/ansible-replace-in-line-of-code-in-multiple-files-in-a-directory/
+    - name: Find all the ifcfg-e* files and store them in the register
+      raw: find /etc/sysconfig/network-scripts/ -type f -name "ifcfg-e*"
+      register: ifcfg_files
+      tags: update-ifcfg
+
+    - name: Ensure the ifcfg-e* scripts have the proper DOMAIN settings.
+      tags: update-ifcfg
+      lineinfile:
+        dest: '{{item}}'
+        regexp: '^DOMAIN=.*'
+        line: 'DOMAIN="west.com one.west.com wic.west.com corp.westworlds.com svc.west.com icallinc.com us.intercall.com"'
+        state: present
+        #backup: yes
+        insertbefore: "^DEVICE="
+      with_items: ifcfg_files.stdout_lines
+    
+#######################################
+# Update the nscd.conf
+    - name: Increase max-db-size netgroup to 335544320 (from 33554432) on RHEL 6 systems
+      lineinfile:
+        dest: '/etc/nscd.conf'
+        regexp: '^\s*max-db-size\s*netgroup\s*'
+        line: "\tmax-db-size\t\tnetgroup\t335544320"
+      when: (ansible_distribution == "RedHat" and ansible_distribution_major_version == "6")
+
+#######################################
+# SYMCquiesce package (/opt/SYMCquiesce)
+    - name: SYMCquiesce - Check if {{ package_name }} at version {{ symc_version }} is installed
+      # NOTE: Must use the "command: rpm" since the "yum" module does not do package status queries.
+      command: rpm -q {{ package_name }}
+      ignore_errors: True
+      changed_when: False
+      register: rpm_check
+# The "when:" clauses keep these plays from executing when the package is installed and at the current version.
+    - name: SYMCquiesce - Make temp directory to upload to securely
+      action: command mktemp -d
+      register: temp_dir
+      when: (rpm_check.stdout.find('is not installed') > 0) or
+            (rpm_check.stdout.find('{{ symc_version }}') == -1)
+
+    - name: SYMCquiesce - Copy correct file to server based on architecture
+      copy: src="{{ symc_cache_dir }}/SYMCquiesce-{{ symc_version }}.{{ ansible_architecture }}.rpm" dest="{{ temp_file }}"
+      when: (rpm_check.stdout.find('is not installed') > 0) or
+            (rpm_check.stdout.find('{{ symc_version }}') == -1)
+
+    - name: SYMCquiesce - Remove any old versions of the package
+      yum: name={{ package_name }} state=absent
+      when: (rpm_check.stdout.find('is not installed') > 0) or
+            (rpm_check.stdout.find('{{ symc_version }}') == -1)
+
+    - name: SYMCquiesce - Install file from local directory
+      yum: name={{ temp_file }} state=present disable_gpg_check=yes
+      when: (rpm_check.stdout.find('is not installed') > 0) or
+            (rpm_check.stdout.find('{{ symc_version }}') == -1)
+
+    - name: SYMCquiesce - Cleanup temporary directory and packges
+      file: path={{ temp_dir.stdout }} state=absent
+      when: (rpm_check.stdout.find('is not installed') > 0) or
+            (rpm_check.stdout.find('{{ symc_version }}') == -1)
+
+
+#######################################
+# Update IPTables
+    - name: IPTables - install consistent version
+      template: src="{{ iptables_cache_dir }}/iptables.{{ ansible_distribution_major_version }}.save.j2" dest="{{ iptables_conf_file }}" backup=yes mode=0600
+      notify:
+        - Reload IPTables
+
+#######################################
+# Update NTP config file
+### - http://eitnet10.west.com/sites/ESE/Public%20Documents/Infrastructure/NTP/ETS%20Technical%20Standard%20-%20NTP.docx
+    - name: NTP - Ensure ntp is installed
+      package: name=ntp state=present use=yum
+    - name: NTP - Copy proper NTP.conf file
+      template: src="{{ ntp_conf_file }}" dest="/etc/ntp.conf" mode=0644
+      notify:
+        - Restart NTP
+    - name: NTP - Ensure startup options set
+      replace: dest=/etc/sysconfig/ntpd regexp='^OPTIONS=.*$' replace='OPTIONS="-u ntp:ntp -p /var/run/ntpd.pid -g -l /var/log/ntpd.log"'
+      notify:
+        - Restart NTP
+
+#######################################
+# Setup single user mode in /etc/sysconfig/init.
+    - name: RHEL 6 fix lilo-linux-single-user-mode
+      replace: dest=/etc/sysconfig/init regexp='^SINGLE=.*$' replace='SINGLE=/sbin/sulogin'
+      when: (ansible_distribution == "RedHat" and ansible_distribution_major_version == "6")
+    - name: RHEL 5 fix lilo-linux-single-user-mode
+      lineinfile: dest=/etc/inittab line='su:S:wait:/sbin/sulogin' state=present insertbefore='^id:.:initdefault:' regexp='(~|su):S:wait:/sbin/.*'
+      when: (ansible_distribution == "RedHat" and ansible_distribution_major_version == "5")
+
+#######################################
+# Add the bridge module just for this run
+# Eliminates the error: "net.bridge.*" is an unknown key errors
+    - modprobe: name=bridge state=present
+
+#######################################
+# Fix (disable) icmp redirects in sysctl
+    - name: fix linux-icmp-redirect 1
+      sysctl: name=net.ipv4.conf.all.accept_redirects value=0 sysctl_set=yes state=present
+      notify:
+        - Reload sysctl
+    - name: fix linux-icmp-redirect 2
+      sysctl: name=net.ipv4.conf.default.accept_redirects value=0 sysctl_set=yes state=present
+      notify:
+        - Reload sysctl
+    - name: fix linux-icmp-redirect 3
+      sysctl: name=net.ipv4.conf.all.secure_redirects value=0 sysctl_set=yes state=present
+      notify:
+        - Reload sysctl
+    - name: fix linux-icmp-redirect 4
+      sysctl: name=net.ipv4.conf.default.secure_redirects value=0 sysctl_set=yes state=present
+      notify:
+        - Reload sysctl
+    - name: fix net.ipv4.tcp_timestamps 5
+      sysctl: name=net.ipv4.tcp_timestamps value=0 sysctl_set=yes state=present
+      notify:
+        - Reload sysctl
+
+#######################################
+# Disable source routing
+    - name: Disable all source routing
+      sysctl: name=net.ipv4.conf.all.accept_source_route value=0 sysctl_set=yes state=present
+      notify:
+        - Reload sysctl
+
+#######################################
+# Disable IP forwarding
+    - name: Disable all forwarding
+      sysctl: name=net.ipv4.conf.all.forwarding value=0 sysctl_set=yes state=present
+      notify:
+        - Reload sysctl
+
+#######################################
+# Disable default source routing
+    - name: Disable default source routing
+      sysctl: name=net.ipv4.conf.default.accept_source_route value=0 sysctl_set=yes state=present
+      notify:
+        - Reload sysctl
+    - name: Disable default forwarding
+      sysctl: name=net.ipv4.conf.default.forwarding value=0 sysctl_set=yes state=present
+      notify:
+        - Reload sysctl
+#######################################
+# Disable "rquotad" service - 160613 - SDR 7225941
+    - name: RHEL 5 & 6 disable rquotad service (CVE-1999-0625) (remove any existing)
+      replace: dest=/etc/sysconfig/nfs regexp='^RQUOTAD=.*$' replace='RQUOTAD=no'
+      when: (ansible_distribution == "RedHat" and
+              ( ansible_distribution_major_version == "6" or
+                ansible_distribution_major_version == "5"
+              )
+            )
+    - name: RHEL 5 & 6 disable rquotad service (CVE-1999-0625) (disable)
+      lineinfile: dest=/etc/sysconfig/nfs state=present  line='RQUOTAD=no'
+      when: (ansible_distribution == "RedHat" and
+              ( ansible_distribution_major_version == "6" or
+                ansible_distribution_major_version == "5"
+              )
+            )
+#######################################
+# Callback handlers for this playbook.
+  handlers:
+    - name: Reload sysctl
+      sysctl: reload=yes name=.
+
+    - name: Restart NTP
+      service: name=ntpd state=restarted
+
+    - name: Reload IPTables
+      service: name=iptables state=restarted

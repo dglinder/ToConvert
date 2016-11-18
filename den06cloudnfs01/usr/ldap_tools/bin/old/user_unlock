@@ -1,0 +1,342 @@
+#!/bin/bash
+
+###########################################
+# Purpose: Edit an LDAP user
+# Author: SDW
+# Incept 09/06/2012
+
+# Notes: - basic LDAP authentication must already be configured and working
+#          on the server where this script is run from
+f_Usage () {
+   echo "$0 USAGE"
+   echo ""
+   echo "$0 <user name>"
+   echo ""
+   echo "   Opens a user account up for editing. If a user name is not"
+   echo "   speified on the command line, you will be prompted to provide"
+   echo "   one."
+   echo ""
+   echo "   Note: users cannot be re-named. You will need to create"
+   echo "   a new user with the desired name and delete the old one."
+   echo ""
+}
+
+#############################################
+# f_FormatDate()
+# Purpose: change LDAP date format to more familiar
+#          format
+#
+# Usage: f_FormatDate <DATESTRING>
+#
+# Where <DATESTRING> is in format YYYYMMDDHHMMSSZ
+
+f_FormatDate() {
+
+   # 20130130193715Z
+   # Times given will be in Zulu
+
+
+   DS=$1
+
+   # Determine time difference from zulu
+   let DIFF=`date +%H`-`date -u +%H`
+
+   # Separate the given date string into its components
+   YYYY=`echo $DS | cut -c 1-4`
+   NM=`echo $DS | cut -c 5-6`
+   ND=`echo $DS | cut -c 7-8`
+   ZH=`echo $DS | cut -c 9-10`
+   MM=`echo $DS | cut -c 11-12`
+   SS=`echo $DS | cut -c 13-14`
+
+   let LH=$ZH+$DIFF
+   # If the resulting "local hour" is less than zero, then we
+   # need to subtract it from 24 and decriment the date by 1
+   if [[ $LH -lt 0 ]]; then
+      let LH=24+$LH
+      let ND=$ND-1
+   # If the resulting "local hour" is greater than 23 then
+   # we need to subtract it from 24 and increment the date by 1
+   elif [[ $LH -gt 23 ]]; then
+      let LH=$LH-24
+      let ND=$ND+1
+   fi
+
+   # Set the local 12-hour hour and period
+   if [[ $LH -eq 12 ]]; then
+      PERIOD=PM
+      LH12=$LH
+   elif [[ $LH -gt 12 ]]; then
+      PERIOD=PM
+      let LH12=$LH-12
+   elif [[ $LH -eq 0 ]]; then
+      PERIOD=AM
+      LH12=12
+   else
+      PERIOD=AM
+      LH12=$LH
+   fi
+
+
+   case $NM in
+
+      01) AD=January
+          ADA=Jan
+          ;;
+      02) AD=February
+          ADA=Feb
+          ;;
+      03) AD=March
+          ADA=Mar
+          ;;
+      04) AD=April
+          ADA=Apr
+          ;;
+      05) AD=May
+          ADA=May
+          ;;
+      06) AD=June
+          ADA=Jun
+          ;;
+      07) AD=July
+          ADA=Jul
+          ;;
+      08) AD=August
+          ADA=Aug
+          ;;
+      09) AD=September
+          ADA=Sep
+          ;;
+      10) AD=October
+          ADA=Oct
+          ;;
+      11) AD=November
+          ADA=Nov
+          ;;
+      12) AD=December
+          ADA=Dec
+          ;;
+       *) AD=Error
+          ADA=Err
+          ;;
+   esac
+
+   #echo "$AD $ND ${LH12}:${MM}:${SS} $PERIOD"
+   echo "${NM}/${ND}/${YYYY} ${LH12}:${MM}:${SS} $PERIOD"
+
+
+}
+
+
+# Set path to the location of the script no matter how it was invoked
+if [[ `echo $0 | sed 's/^.\///g'` == `basename $0` ]]; then
+   WORKDIR=`pwd`
+else
+   BASENAME=`basename $0`
+   WORKDIR=`echo $0 | sed 's/'"$BASENAME"'$//g'`
+fi
+
+cd $WORKDIR
+
+# Set some basic options for ldap searching, durrently the directory server doesn't require a binddn or a rootbinddn
+# so simple authentication should work fine
+LDAP_SEARCH="/usr/bin/ldapsearch -x -ZZ"
+UPDATE_USER=`ldapsearch -x -ZZ "(uid=$USER)" dn | grep ^dn: | sed 's/^dn:[ \t]//'`
+LDAP_MODIFY="/usr/bin/ldapmodify -x -ZZ -D \"$UPDATE_USER\""
+LDAP_BT="$LDAP_SEARCH '(ou=SUDOers)' -D \"$UPDATE_USER\" -w"
+MAXTRIES=5
+
+# Temp file to hold any ldif that we might need to push to the directory
+LDIF_TMP=/eit/admin/scripts/ldap_tools/tmp/.`basename $0`.$$.ldt
+LDIF_IN_TMP=/tmp/$$.uel.$$.ldt
+EDITFILE=/tmp/$$.uef
+BACKUP_DIR=/eit/admin/scripts/ldap_tools/local_backup
+TS=`date +%Y%m%d%H%M%S`
+
+
+# find the ldap base
+if [[ -s /etc/ldap.conf ]]; then
+   LDC=/etc/ldap.conf
+elif [[ -s /etc/openldap/ldap.conf ]]; then
+   LDC=/etc/openldap/ldap.conf
+fi
+LDAP_BASE=`egrep -i "^base[ \t]" $LDC | sed 's/^base[ \t]//i'`
+
+if [[ -z $LDAP_BASE ]]; then 
+   echo "Unable to find the base dn for LDAP - please make sure ldap is properly"
+   echo "configured on this machine.  If it IS properly configured and you're"
+   echo "still getting this error, you probably need to update the LDAP_SEARCH"
+   echo "variable in this script to something that works with the current config."
+   exit
+fi
+
+if [[ -z $UPDATE_USER ]]; then
+   echo "Unable to locate the correct DN for your user account [$USER]."
+   echo "You must be a member of the domain in order to use this script."
+   exit
+fi
+
+
+
+# Get information from the user
+
+UTBE=$1
+
+# If we got a name from the command line
+if [[ -n $UTBE ]]; then
+
+   if [[ "$UTBE" == "--help" ]]; then
+      f_Usage
+      exit
+   fi
+   # Verify the netgroup exists
+   if [[ -z `$LDAP_SEARCH -b $LDAP_BASE "(uid=${UTBE})" uid | grep ^uid:` ]]; then
+      echo "ERROR: user \"$UTBE\" not found in the directory."
+      exit
+   else
+      UTBEDN=`$LDAP_SEARCH -b $LDAP_BASE "(uid=${UTBE})" dn | sed ':a;N;$!ba;s/\n //g' | grep $UTBE | grep ^dn: | sed 's/^dn: //g'`
+   fi
+
+# If we did NOT get a name from the command line 
+else 
+
+   # Prompt the user for a name
+   VC2=FALSE
+   while [[ $VC2 == FALSE ]]; do
+      unset GUTBE
+      read -p "What is the name of the user to be unlocked?: " GUTBE
+
+      # Check for non-existence - retry on error
+      if [[ -z `$LDAP_SEARCH -b ou=People,$LDAP_BASE "(uid=${GUTBE})" uid | grep ^uid:` ]]; then
+         echo "ERROR: user \"$GUTBE\" not found in the directory."
+         read -p "Press Enter to try a different name, Ctrl+C to cancel." JUNK
+         tput uu1; tput el; tput uu1; tput el; tput uu1; tput el
+      else
+         VC2=TRUE
+         UTBE=$GUTBE
+         UTBEDN=`$LDAP_SEARCH -b $LDAP_BASE "(uid=${UTBE})" dn | sed ':a;N;$!ba;s/\n //g' | grep $UTBE | grep ^dn: | sed 's/^dn: //g'`
+      fi
+   done
+fi
+
+# Output the user's ldap entry to a temp file
+
+$LDAP_SEARCH -b $LDAP_BASE "(uid=${UTBE})" passwordretrycount retrycountresettime accountunlocktime | sed ':a;N;$!ba;s/\n //g'> $LDIF_IN_TMP
+RETRYCOUNT=`grep ^passwordretrycount: $LDIF_IN_TMP | awk '{print $2}'`
+RESETTIME=`grep ^retrycountresettime: $LDIF_IN_TMP | awk '{print $2}'`
+UNLOCKTIME=`grep ^accountunlocktime: $LDIF_IN_TMP | awk '{print $2}'`
+
+# Set the time for now in LDAP format for Zulu time
+NOWZL=`date -u +%Y%m%d%H%M%SZ`
+
+# Set the present time in seconds since Epoc
+NOW=`date +%s`
+
+# Convert times on account to seconds since EPOC
+if [[ -n $UNLOCKTIME ]]; then
+   UTSTRING=`f_FormatDate $UNLOCKTIME`
+   UT=`date -d "$UTSTRING" +%s`
+fi
+if [[ -n $RESETTIME ]]; then
+   RTSTRING=`f_FormatDate $RESETTIME`
+   RT=`date -d "$RTSTRING" +%s`
+fi
+
+# Exit if the user is not actually locked
+if [[ -z $UNLOCKTIME ]] || [[ $UT -le $NOW  ]]; then
+  echo "User $UTBE is not locked."
+  /bin/rm $LDIF_IN_TMP
+  exit
+fi
+
+
+# Build our LDIF based on the new information, we'll be replacing the values
+# with whatever was read in from the edited file
+
+if [[ -f $LDIF_TMP ]]; then
+   /bin/rm $LDIF_TMP
+fi
+
+# Create a backup of the account
+if [[ ! -d $BACKUP_DIR ]]; then
+   mkdir -p $BACKUP_DIR
+fi
+LDIF_BAK=${BACKUP_DIR}/user_unlocked_${UTBE}_${TS}.ldif
+
+echo "## Script Name: $0" > $LDIF_BAK
+echo "## Executed By/From: `/usr/bin/who -m`" >> $LDIF_BAK
+echo "##" >> $LDIF_BAK
+echo "## Object Before Modification:" >> $LDIF_BAK
+
+$LDAP_SEARCH -b $LDAP_BASE "(uid=${UTBE})" 2>&1 | egrep -v '^#|^$|^search|^result' > $LDIF_BAK
+if [[ ! -s $LDIF_BAK ]]; then
+   echo "Error: there was a problem creating a backup of $SRTBE"
+   exit
+fi
+
+
+# Specify the DN of the user to be unlocked
+echo "dn: $UTBEDN" > $LDIF_TMP
+echo "changetype: modify" >> $LDIF_TMP
+
+# Set passwordretrycount back to 0
+if [[ -n `grep -i ^passwordretrycount:  $LDIF_IN_TMP` ]]; then
+   echo "replace: passwordretrycount" >> $LDIF_TMP
+else
+   echo "add: passwordretrycount" >> $LDIF_TMP
+fi
+echo "passwordretrycount: 0" >> $LDIF_TMP
+echo "-" >> $LDIF_TMP
+
+# set retrycountresettime to now
+if [[ -n `grep -i ^retrycountresettime:  $LDIF_IN_TMP` ]]; then
+   echo "replace: retrycountresettime" >> $LDIF_TMP
+else
+   echo "add: retrycountresettime" >> $LDIF_TMP
+fi
+echo "retrycountresettime: $NOWZL" >> $LDIF_TMP
+echo "-" >> $LDIF_TMP
+
+# remove accountunlocktime completely
+if [[ -n `grep -i ^accountunlocktime:  $LDIF_IN_TMP` ]]; then
+   echo "delete: accountunlocktime" >> $LDIF_TMP
+fi
+echo "-" >> $LDIF_TMP
+
+echo "## Attempted Modification:" >> $LDIF_BAK
+echo "##" >> $LDIF_BAK
+cat $LDIF_TMP | sed 's/^/#/g' >> $LDIF_BAK
+
+
+
+# Verify LDAP password
+VP=FALSE
+TRIES=0
+while [[ $VP == FALSE ]] && [[ $TRIES -le $MAXTRIES ]]; do
+   read -sp "LDAP Password ($UPDATE_USER): " UUP
+   echo "$LDAP_BT \"$UUP\"" | /bin/bash 2>&1 >/dev/null
+   if [[ $? != 0 ]]; then
+      unset UUP
+      let TRIES=$TRIES+1
+   else
+      echo ""
+      VP=TRUE
+   fi
+done
+
+
+echo "$LDAP_MODIFY -w \"$UUP\" -a -f $LDIF_TMP " | /bin/bash
+if [[ $? != 0 ]]; then
+   echo "There was an error adding the object(s)"
+   echo "The command that failed was:"
+   echo "   $LDAP_MODIFY -W -a -f $LDIF_TMP"
+   echo ""
+   echo "## Update failed" >> $LDIF_BAK
+   exit
+fi
+
+echo "## Update succeeded" >> $LDIF_BAK
+
+/bin/rm $LDIF_TMP
+
+

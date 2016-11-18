@@ -1,0 +1,348 @@
+#!/bin/bash
+
+###########################################
+# Purpose: Create A New Netgroup
+# Author: SDW
+# Incept 08/08/2012
+
+# Notes: - basic LDAP authentication must already be configured and working
+#          on the server where this script is run from
+
+f_Usage () {
+   echo "$0 USAGE"
+   echo ""
+   echo "$0 [-h|-u|-m] <name>"
+   echo ""
+   echo "   -h   Create a new host netgroup called <name>_hosts"
+   echo ""
+   echo "   -u   Create a new user netgroup called <name>_users"
+   echo ""
+   echo "   -s   Create a new Service Account netgroup called <name>_sa"
+   echo ""
+   echo "   -m   Create a new machine netgroup called <name>_machine"
+   echo "        Administrative user netgroups will automatically be"
+   echo "        added to each new machine netgroup."
+   echo ""
+   echo " Note: parameters are not specified on the command line"
+   echo "       you will be prompted for type and name interactively."
+   echo ""
+}
+
+# Set path to the location of the script no matter how it was invoked
+if [[ `echo $0 | sed 's/^.\///g'` == `basename $0` ]]; then
+   WORKDIR=`pwd`
+else
+   BASENAME=`basename $0`
+   WORKDIR=`echo $0 | sed 's/'"$BASENAME"'$//g'`
+fi
+
+cd $WORKDIR
+
+
+# Set some basic options for ldap searching, durrently the directory server doesn't require a binddn or a rootbinddn
+# so simple authentication should work fine
+LDAP_SEARCH="/usr/bin/ldapsearch -x -ZZ"
+UPDATE_USER=`ldapsearch -x -ZZ "(uid=$USER)" dn | grep ^dn: | sed 's/^dn:[ \t]//'`
+BACKUP_DIR=/eit/admin/scripts/ldap_tools/local_backup
+TS=`date +%Y%m%d%H%M%S`
+#LDAP_MODIFY="/usr/bin/ldapmodify -x -ZZ -W -D \"$UPDATE_USER\""
+LDAP_MODIFY="/usr/bin/ldapmodify -x -ZZ -D \"$UPDATE_USER\""
+LDAP_BT="$LDAP_SEARCH '(ou=SUDOers)' -D \"$UPDATE_USER\" -w"
+MAXTRIES=5
+
+
+# Temp file to hold any ldif that we might need to push to the directory
+LDIF_TMP=/eit/admin/scripts/ldap_tools/tmp/.`basename $0`.$$.ldt
+
+# find the ldap base
+if [[ -s /etc/ldap.conf ]]; then
+   LDC=/etc/ldap.conf
+elif [[ -s /etc/openldap/ldap.conf ]]; then
+   LDC=/etc/openldap/ldap.conf
+fi
+LDAP_BASE=`egrep -i "^base[ \t]" $LDC | sed 's/^base[ \t]//i'`
+
+if [[ -z $LDAP_BASE ]]; then 
+   echo "Unable to find the base dn for LDAP - please make sure ldap is properly"
+   echo "configured on this machine.  If it IS properly configured and you're"
+   echo "still getting this error, you probably need to update the LDAP_SEARCH"
+   echo "variable in this script to something that works with the current config."
+   exit
+fi
+
+# Look for a "Netgroups" OU at the base level
+NG_BASE=`$LDAP_SEARCH '(ou=Netgroups)' | grep "dn: ou" | awk '{print $2}'`
+
+# If there is no Netgroups OU then we need to create the OU
+if [[ -z $NG_BASE ]]; then 
+  echo "No Netgroup OU was found at $LDAP_BASE..."
+  echo "Please run the appropriate script from directory-setup"
+  echo "and try again."
+  exit
+fi
+
+if [[ -z $UPDATE_USER ]]; then
+   echo "Unable to locate the correct DN for your user account [$USER]."
+   echo "You must be a member of the domain in order to use this script."
+   exit
+fi
+
+
+
+# Get information from the user
+
+TYPE=$1
+NAME=$2
+
+
+# If we got a type from the command line
+if [[ -n $TYPE ]]; then
+
+   # Set the suffix according to type, or exit on error
+   case $TYPE in
+
+       --help ) f_Usage
+                exit
+                ;;
+      -h | -H ) SUFFIX="_hosts"
+                SUBOU="Hosts"
+                ;;
+      -u | -U ) SUFFIX="_users"
+                SUBOU="Users"
+                ;;
+      -s | -S ) SUFFIX="_sa"
+                SUBOU="SA"
+                ;;
+      -m | -M ) SUFFIX="_machine"
+                SUBOU="Machines"
+                ;;
+            * ) echo "\"$TYPE\" is an invalid netgroup type."
+                f_Usage
+                exit
+   esac
+
+# If we did NOT get type from the command line
+else
+
+   # Ask the user to pick a ype and set the suffix accordingly, retry on error
+   VC1=FALSE
+   while [[ $VC1 == FALSE ]]; do
+      unset GTYPE
+      echo "H = host netgroup, U = user netgroup, S = Service Account Netgroup, M = machine netgroupp?"
+      read -p "Type? (H|U|S|M): " GTYPE
+      if [[ -z `echo $GTYPE | egrep -i '^H$|^U$|^S$|^M$'` ]]; then
+         echo "\"$GTYPE\" is not a valid choice."
+         read -p "Press Enter to try again, Ctrl+C to cancel." JUNK
+         tput uu1; tput el; tput uu1; tput el; tput uu1; tput el
+      else
+         VC1=TRUE
+         if [[ -n `echo $GTYPE | grep -i '^H'` ]]; then
+            SUFFIX="_hosts"
+            SUBOU="Hosts"
+         elif [[ -n `echo $GTYPE | grep -i '^U'` ]]; then
+            SUFFIX="_users"
+            SUBOU="Users"
+         elif [[ -n `echo $GTYPE | grep -i '^S'` ]]; then
+            SUFFIX="_sa"
+            SUBOU="SA"
+         elif [[ -n `echo $GTYPE | grep -i '^M'` ]]; then
+            SUFFIX="_machine"
+            SUBOU="Machines"
+         fi
+      fi
+   done
+fi
+
+# If we got a name from the command line
+if [[ -n $NAME ]]; then
+   # Remove unsafe characters from the name
+   SNAME=`echo $NAME | tr -d '\`!@$%^&*()+=/|[]{}:;"\\'\''' | sed 's/_users$//; s/_hosts//; s/_sa$//; s/_machine//'`
+
+   # Construct the new netgroup name by adding the suffix - if the user didn't provide it on the command line
+   NNGNAME="${SNAME}${SUFFIX}"
+
+   # Check for duplicates and exit on error
+   if [[ -n `$LDAP_SEARCH -b $NG_BASE "(cn=${NNGNAME})" 2>&1 | egrep -v '^#|^$|^search|^result'` ]]; then
+      echo "ERROR: a netgroup named \"$NNGNAME\" already exists."
+      exit
+   fi
+
+# If we did NOT get a name from the command line 
+else 
+
+   # Prompt the user for a name
+   VC2=FALSE
+   while [[ $VC2 == FALSE ]]; do
+      unset GNAME SGNAME NNGNAME
+      if [[ "$SUFFIX" == "_machine" ]]; then
+          NAMEPROMPT='Please provide the short (unqualified) server hostname: '
+      else
+	  NAMEPROMPT='What is the name of the new netgroup?: '
+      fi
+      read -p "$NAMEPROMPT" GNAME
+
+      #Remove unsafe characters from the name given
+      #SNAME=`echo $GNAME | tr -d '\`!@$%^&*()+=/|[]{}:;"\\'\'''`
+      SNAME=`echo $GNAME | tr -d '\`!@$%^&*()+=/|[]{}:;"\\'\''' | sed 's/_users$//; s/_hosts//; s/_sa$//; s/_machine//'`
+
+      # Construct the new netgroup name by adding the suffix
+      NNGNAME="${SNAME}${SUFFIX}"
+
+      # Check for duplicates - retry on error
+      if [[ -n `$LDAP_SEARCH -b $NG_BASE "(cn=${NNGNAME})" 2>&1 | egrep -v '^#|^$|^search|^result'` ]]; then
+         echo "ERROR: a netgroup named \"$NNGNAME\" already exists."
+         read -p "Press Enter to try a different name, Ctrl+C to cancel." JUNK
+         tput uu1; tput el; tput uu1; tput el; tput uu1; tput el
+      else
+         VC2=TRUE
+      fi
+   done
+fi
+
+
+# Create the ldif
+
+cat << EOF > $LDIF_TMP
+dn: cn=$NNGNAME,ou=$SUBOU,$NG_BASE
+cn: $NNGNAME
+objectClass: top
+objectClass: nisnetgroup
+EOF
+
+# If adding a new machine netgroup, then add the UnixAdmin_users netgroup to it
+
+if [[ "$SUFFIX" == "_machine" ]]; then
+   echo "Adding Machine-Type netgroup"
+   echo ""
+   echo "Please provide the following information about $SNAME"
+   read -p "   Serial Number: " SERIAL
+   read -p "    Product Name: " PN
+   read -p "    IPv4 Address: " IPADDR
+   echo ""
+   TIME=`date +%Y%m%e%H%M%Z`
+
+cat << EOF >> $LDIF_TMP
+memberNisNetgroup: UnixAdmin_users
+memberNisNetgroup: StorageAdmin_users
+memberNisNetgroup: EITNightOps_users
+memberNisNetgroup: eitscanp_sa
+nisNetgroupTriple: ($SNAME,-,)
+EOF
+
+else
+   echo ""
+   echo "Please provide a brief description of this netgroup."
+   read -p "Description: " GDESC
+   SDESC=`echo $GDESC | tr -d '\`!@$%^&*()+=/|[]{}:;"\\'\'''`
+   echo "Description: $SDESC" >> $LDIF_TMP
+fi
+
+# Write netgrup creation details to the backup logs
+if [[ ! -d $BACKUP_DIR ]]; then
+   mkdir -p $BACKUP_DIR
+fi
+LDIF_BAK=${BACKUP_DIR}/ng_created_${NNGNAME}_${TS}.ldif
+
+echo "## Script Name: $0" > $LDIF_BAK
+echo "## Executed By/From: `/usr/bin/who -m`" >> $LDIF_BAK
+echo "##" >> $LDIF_BAK
+
+cat $LDIF_TMP >> $LDIF_BAK
+if [[ ! -s $LDIF_BAK ]]; then
+   echo "Error: there was a problem writing the create log for $NNGNAME"
+   exit
+#else
+#   echo "Create log written: $LDIF_BAK"
+fi
+
+# If adding a machine netgroup, require the user to enter his/her password
+# rather than the Ops password.
+if [[ "$SUFFIX" == "_machine" ]]; then
+   ALG=eitldjap
+   VC1=FALSE
+   while [[ "$VC1" == "FALSE" ]]; do
+      read -p "User account with rights to add/edit a machine account in ds.west.com: " JUSER
+      if [[ -n $JUSER ]]; then
+         # Check to see if the user does have rights
+         APG_GOOD=FALSE
+
+         # Check to see if the user account exists in the directory
+         if [[ -z `$LDAP_SEARCH -b "ou=People,${LDAP_BASE}" "(uid=${JUSER})" uid | grep "^uid:"` ]]; then
+            echo "Error, user [$JUSER] does not exist in the directory."
+            unset JUSER
+            read -p "Ctrl+C to quit, anything else to try again: " JUNK
+            tput cuu1; tput el;tput cuu1; tput el;tput cuu1; tput el
+
+         else
+            # Check LDAP group membership
+
+            # Get the numeric ID for the POSIX group
+            #PGNID=`$LDAP_SEARCH -b $PG_BASE "(&(objectClass=posixgroup)(cn=${APG}))" gidNumber | grep "^gidNumber:" | sed 's/^gidNumber:[ \t]//'`
+            #JUNGN=`$LDAP_SEARCH -b "ou=People,${LDAP_BASE}" "(uid=${JUSER})" gidNumber | grep "^gidNumber:" | sed 's/^gidNumber:[ \t]//'`
+
+            # Get the DN for the user
+            JUSERDN=`$LDAP_SEARCH -b "ou=People,${LDAP_BASE}" "(uid=${JUSER})" dn | grep "^dn:" | sed 's/^dn:[ \t]//'`
+
+            if [[ -n `$LDAP_SEARCH -b "ou=Groups,${LDAP_BASE}" "(&(objectClass=groupofuniquenames)(cn=${ALG}))" uniqueMember | grep "^uniqueMember:" | grep "$JUSERDN"` ]]; then
+               VC1=TRUE
+            else
+               echo "Error, user [$JUSER] does not have rights to add/modify machine accounts."
+               unset JUSER
+               read -p "Ctrl+C to quit, anything else to try again: " JUNK
+               tput cuu1; tput el;tput cuu1; tput el;tput cuu1; tput el
+            fi
+
+         fi
+
+      else
+         tput cuu1; tput el
+      fi
+
+   done
+
+   # Add the description after we've validated the JUSER
+
+   echo "Description: :::$SERIAL::$SNAME::$PN::$TIME::$IPADDR::$JUSER:::" >> $LDIF_TMP
+
+   # Change the update user from default
+   UPDATE_USER=$JUSERDN
+
+   # Re-define the bind test and the ldap update commands
+   LDAP_BT="$LDAP_SEARCH '(ou=SUDOers)' -D \"$JUSERDN\" -w"
+   LDAP_MODIFY="/usr/bin/ldapmodify -x -ZZ -D \"$UPDATE_USER\""
+
+fi
+   
+# Verify LDAP password
+VP=FALSE
+TRIES=0
+while [[ $VP == FALSE ]] && [[ $TRIES -le $MAXTRIES ]]; do
+   read -sp "LDAP Password ($UPDATE_USER): " UUP
+   echo "$LDAP_BT \"$UUP\"" | /bin/bash 2>&1 >/dev/null
+   if [[ $? != 0 ]]; then
+      unset UUP
+      let TRIES=$TRIES+1
+   else
+      echo ""
+      VP=TRUE
+   fi
+done
+
+
+echo "$LDAP_MODIFY -w \"$UUP\" -a -f $LDIF_TMP " | /bin/bash
+if [[ $? != 0 ]]; then
+   echo "There was an error adding the object(s)"
+   echo "The command that failed was:"
+   echo "   $LDAP_MODIFY -W -a -f $LDIF_TMP"
+   echo ""
+   echo "## Update failed" >> $LDIF_BAK
+   exit
+fi
+echo "## Update succeeded" >> $LDIF_BAK
+/bin/rm $LDIF_TMP
+
+exit
+echo "New Netgroup Details:"
+$LDAP_SEARCH -b $NG_BASE "(cn=${NNGNAME})" | awk /"# requesting"/,/"# search result"/ | egrep -v "^#$|^$|requesting:|search result"
+
+

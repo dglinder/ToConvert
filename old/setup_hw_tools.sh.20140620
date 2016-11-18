@@ -1,0 +1,317 @@
+#!/bin/bash
+
+# Include common_functions.h
+if [[ -s /maint/scripts/common_functions.h ]]; then
+   source /maint/scripts/common_functions.h
+elif [[ -s common_functions.h ]]; then
+   source common_functions.h
+else
+   echo "Critical dependency failure: unable to locate common_functions.h"
+   exit 1
+fi
+
+# Start logging if applicable
+if [[ -n $LOGFILE ]] && [[ -n $VTS ]]; then
+   echo "`$VTS`:$0 - Hardware Tools Installation" | $LOG1
+fi
+
+IMGSRVIP=`f_GetImageServerIP`
+
+
+VENDOR=`f_GetVendor`
+#VENDOR=IBM
+
+case $VENDOR in
+
+      IBM) if [[ -n $LOGFILE ]] && [[ -n $VTS ]]; then
+              echo "`$VTS`:$0 Detected IBM hardware." | $LOG1
+           fi
+           echo "Detected IBM hardware."
+
+           # See if Director is already installed
+           INSTALLED_VERSION=`rpm -qa | grep ISDCommonAgent | awk -F'-' '{print $2}'`
+           if [[ -n $INSTALLED_VERSION ]]; then
+              if [[ -n $LOGFILE ]] && [[ -n $VTS ]]; then
+                 echo "`$VTS`:$0 IBM Director version $INSTALLED_VERSION is already installed. Uninstall manually if you wish to re-install." | $LOG1
+              fi
+              echo "IBM Director version $INSTALLED_VERSION is already installed. Uninstall manually if you wish to re-install."
+              exit 0
+           else
+              if [[ -n $LOGFILE ]] && [[ -n $VTS ]]; then
+                 echo "`$VTS`:$0 IBM Director will be installed." | $LOG1
+              fi
+              echo "IBM Director will be installed"
+
+           fi
+
+           # Set up some base locations
+           BASEURL="http://${IMGSRVIP}/hw_tools/IBM"
+           LOCALDIR=/maint/scripts/hw_tools/IBM
+           if [[ ! -d "$LOCALDIR" ]]; then mkdir -p "$LOCALDIR"; fi
+
+           # Get version information from the server
+           REMOTEVER=`wget -q ${BASEURL}/current.txt -O - | grep -i VERSION | awk -F'=' '{print $2}'`
+           if [[ -s "${LOCALDIR}/current.txt" ]]; then
+              LOCALVER=`grep -i ^VERSION "${LOCALDIR}/current.txt" | awk -F'=' '{print $2}'`
+           fi
+           if [[ -z $LOCALVER ]] && [[ -z $REMOTEVER ]]; then
+              if [[ -n $LOGFILE ]] && [[ -n $VTS ]]; then
+                 echo "`$VTS`:$0 Fatal Error: unable to get version information from ${LOCALDIR}/current.txt" | $LOG1
+              fi
+              echo "Fatal Error: unable to get version information from ${LOCALDIR}/current.txt"
+              exit 15
+           fi
+           
+           # See if we need to download a new copy from the image server
+           if [[ -n $REMOTEVER ]] && [[ "$LOCALVER" != "$REMOTEVER" ]]; then
+              if [[ -n $LOGFILE ]] && [[ -n $VTS ]]; then
+                 echo "`$VTS`:$0 Detected different version of Director on image server, downloading..." | $LOG1
+              fi
+              echo "Detected different version of Director on image server, downloading..."
+              wget --progress=bar:force "${BASEURL}/${REMOTEVER}" -O "${LOCALDIR}/${REMOTEVER}" 2>&1 | f_WgetProgOnly
+             
+              # If we successfully downloaded a new copy then make that the version we'll attempt to install
+              if [[ -s "${LOCALDIR}/${REMOTEVER}" ]]; then
+                 LOCALVER=$REMOTEVER
+                 echo "VERSION=${LOCALVER}" > "${LOCALDIR}/current.txt"
+              fi
+
+           fi
+        
+           # Determine what server we're going to use
+           HCSERVLIST="10.27.115.96 10.70.1.14 10.27.115.25"
+           RSERVLIST=`wget -q ${BASEURL}/servlist.txt -O - | grep -i VERSION | awk -F'=' '{print $2}'`
+           if [[ -n "$RSERVLIST" ]]; then
+              if [[ -n $LOGFILE ]] && [[ -n $VTS ]]; then
+                 echo "`$VTS`:$0 Using Director Server list from $IMGSRVIP" | $LOG1
+              fi
+              echo "Using Director Server list from $IMGSRVIP"
+              SERVLIST=$RSERVLIST
+           else
+              if [[ -n $LOGFILE ]] && [[ -n $VTS ]]; then
+                 echo "`$VTS`:$0 Using hard-coded Director Server List" | $LOG1
+              fi
+              echo "Using hard-coded Director Server List."
+              SERVLIST=$HCSERVLIST
+           fi
+
+           # Elect a Director Server
+           TMPLST=/tmp/dlist.${TS}
+           if [[ -f $TMPLST ]]; then /bin/rm $TMPLST; fi
+           best=
+           besttime=
+           for s in $SERVLIST; do
+   
+              tput cuu1; tput el
+              echo -n "Checking server $s"
+              # Collect the average of 4 pings
+              time=`ping -q -c4 $s | grep rtt | awk '{print $4}' | awk -F'/' '{print $2}'`
+              echo "...ping time $time"
+              echo "$s,$time" >> $TMPLST
+              if [[ -z $besttime ]] || ( [[ -n $time ]] && [[ $time < $besttime ]] ); then
+                 best=$s
+                 besttime=$time
+              fi
+           done
+
+           if [[ -n $best ]]; then
+              EDIRIP=$best
+              if [[ -n $LOGFILE ]] && [[ -n $VTS ]]; then
+                 echo "`$VTS`:$0 Elected Director Server IP ${EDIRIP}" | $LOG1
+              fi
+              echo "Elected Director Server IP ${EDIRIP}"
+           else
+              if [[ -n $LOGFILE ]] && [[ -n $VTS ]]; then
+                 echo "`$VTS`:$0 Failure - no Director servers were reachable" | $LOG1
+              fi
+              echo "Failure - no Director servers were reachable"
+              exit 16
+           fi
+
+           # Unpack the agent tarball
+           DIR_TARBALL="${LOCALDIR}/${LOCALVER}"
+           SCRIPTNAME=`tar -tzf "$DIR_TARBALL" | grep "commonagent_linux" | head -1`
+           SCRIPTPATH="${LOCALDIR}/${SCRIPTNAME}"
+           if [[ -f "$SCRIPTPATH" ]]; then /bin/rm $SCRIPTPATH; fi
+           tar -C "${LOCALDIR}" -xzf "${DIR_TARBALL}" "${SCRIPTNAME}"
+           if [[ -s "$SCRIPTPATH" ]]; then
+              if [[ -n $LOGFILE ]] && [[ -n $VTS ]]; then
+                 echo "`$VTS`:$0 Unpacked Installer to $SCRIPTPATH" | $LOG1
+              fi
+              echo "Unpacked Installer to $SCRIPTPATH"
+           else
+              if [[ -n $LOGFILE ]] && [[ -n $VTS ]]; then
+                 echo "`$VTS`:$0 Failure - unable to extract installer" | $LOG1
+              fi
+              echo "Failure - unable to extract installer"
+              exit 17
+           fi
+
+           # Create a diragent.rsp file
+
+               #/opt/ibm/director/agent/runtime/agent/toolkit/bin/configure.sh -amhost 10.27.115.96 -passwd D1r3ct0r!
+
+           RESPF="${LOCALDIR}/diragent.rsp"
+
+           echo "DEBUG_RPM=0" > $RESPF
+           echo "DEBUG_SCRIPTS=0" >> $RESPF
+           echo "FORCE=0" >> $RESPF
+           echo "LOGGING=1" >> $RESPF
+           echo "EXTRACT_ONLY=0" >> $RESPF
+           echo "INTERACTIVE=0" >> $RESPF
+           echo "AGENT_PORT=9510" >> $RESPF
+           echo "AGENT_NONSTOP_PORT_1=9514" >> $RESPF
+           echo "AGENT_NONSTOP_PORT_2=9515" >> $RESPF
+           echo "RPM_PATH=" >> $RESPF
+           echo "AGENT_MANAGER_HOSTNAME=${EDIRIP}" >> $RESPF
+           echo "AGENT_MANAGER_PASSWORD=D1r3ct0r!" >> $RESPF
+
+
+           # Install the agent with the diragent.rsp file
+           DIRINSTLOG=/var/log/install/ibm-director-install.log
+
+           if [[ -n $LOGFILE ]] && [[ -n $VTS ]]; then
+              echo "`$VTS`:$0 Beginning IBM Director Install - details will be logged at $DIRINSTLOG" | $LOG1
+           fi
+           echo "Beginning IBM Director Install - details will be logged at $DIRINSTLOG"
+           echo "   Please be patient, this may take several minutes..."
+
+           # Begin logging
+           echo "" >> $DIRINSTLOG
+           echo "Beginning IBM Director Install `date`" >> $DIRINSTLOG
+           $SCRIPTPATH -i -r $RESPF >> $DIRINSTLOG 2>&1
+           RESULT=$?
+
+           # Double-check if the installation succeeded
+           INSTALLED_VERSION=`rpm -qa | grep ISDCommonAgent | awk -F'-' '{print $2}'`
+
+           # Report results
+           if [[ $RESULT != 0 ]] || [[ -z $INSTALLED_VERSION ]]; then
+              if [[ -n $LOGFILE ]] && [[ -n $VTS ]]; then
+                 echo "`$VTS`:$0 Failure: IBM Director has not been installed: see log for details" | $LOG1
+              fi
+              echo "Failure: IBM Director has not been installed: see log for details"
+           else
+              if [[ -n $LOGFILE ]] && [[ -n $VTS ]]; then
+                 echo "`$VTS`:$0 IBM Director installation succeeded." | $LOG1
+              fi
+              echo "IBM Director installation succeeded - please log in to Director Server ${EDIRIP} to complete discovery."
+              # Server Statement of Origin
+              SSO=/etc/sso
+              echo "IBM_DIRECTOR_SERVER=${EDIRIP}" >> $SSO
+
+           fi
+           ;;
+
+       HP) if [[ -n $LOGFILE ]] && [[ -n $VTS ]]; then
+              echo "`$VTS`:$0 Detected HP hardware. Insight Agent will be installed." | $LOG1
+           fi
+           echo "Detected HP hardware. Insight Agent will be installed."
+           BASEURL="http://${IMGSRVIP}/hw_tools/HP"
+           LOCALDIR=/maint/scripts/hw_tools/HP
+           ;;
+
+   VMWARE) if [[ -n $LOGFILE ]] && [[ -n $VTS ]]; then
+              echo "`$VTS`:$0 Detected VMWare Virtual Machine." | $LOG1
+           fi
+           echo "Detected VMWare Virtual Machine."
+
+           # Check to see if VMware-tools is already installed
+           VMTM=/etc/vmware-tools/manifest.txt.shipped
+           if [[ -s $VMTM ]]; then
+              INSTALLED_VERSION=`grep "^vmtoolsd.version" $VMTM | awk -F '"' '{print $2}'`
+              if [[ -n $LOGFILE ]] && [[ -n $VTS ]]; then
+                 echo "`$VTS`:$0 VMTools version $INSTALLED_VERSION is already installed. Use /etc/vmware-tools/installer.sh uninstall if you wish to re-install." | $LOG1
+              fi
+              echo "VMTools version $INSTALLED_VERSION is already installed. Use /etc/vmware-tools/installer.sh uninstall if you wish to re-install."
+              exit 0
+           else
+              if [[ -n $LOGFILE ]] && [[ -n $VTS ]]; then
+                 echo "`$VTS`:$0 VMTools will be installed." | $LOG1
+              fi
+              echo "VMTools will be installed."
+
+           fi
+           BASEURL="http://${IMGSRVIP}/hw_tools/VMWare"
+           LOCALDIR=/maint/scripts/hw_tools/VMWare
+           if [[ ! -d "$LOCALDIR" ]]; then mkdir -p "$LOCALDIR"; fi
+
+           # Get version information from the server
+           REMOTEVER=`wget -q ${BASEURL}/current.txt -O - | grep -i VERSION | awk -F'=' '{print $2}'`
+           LOCALVER=`grep -i ^VERSION "${LOCALDIR}/current.txt" 2>&1 | grep -v "No such" | awk -F'=' '{print $2}'`
+           if [[ -z $LOCALVER ]] && [[ -z $REMOTEVER ]]; then
+              if [[ -n $LOGFILE ]] && [[ -n $VTS ]]; then
+                 echo "`$VTS`:$0 Fatal Error: unable to get version information for VMTools" | $LOG1
+              fi
+              echo "Fatal Error: unable to get version information for VMTools"
+              exit 15
+           fi
+
+           # See if we need to download a new copy from the image server
+           if [[ -n $REMOTEVER ]] && [[ "$LOCALVER" != "$REMOTEVER" ]]; then
+              if [[ -n $LOGFILE ]] && [[ -n $VTS ]]; then
+                 echo "`$VTS`:$0 Detected different version of VMTools on image server, downloading..." | $LOG1
+              fi
+              echo "Detected different version of VMTools on image server, downloading..."
+              wget --progress=bar:force "${BASEURL}/${REMOTEVER}" -O "${LOCALDIR}/${REMOTEVER}" 2>&1 | f_WgetProgOnly
+
+              # If we successfully downloaded a new copy then make that the version we'll attempt to install
+              if [[ -s "${LOCALDIR}/${REMOTEVER}" ]]; then
+                 LOCALVER=$REMOTEVER
+                 echo "VERSION=${LOCALVER}" > "${LOCALDIR}/current.txt"
+              fi
+
+           fi
+
+           # Unpack and install
+           # Read the top of the tarred directory structure so we know where it will unpack
+           VMTOOLS_TARBALL="${LOCALDIR}/${LOCALVER}"
+           VMTOOLS_INSTLOG=/var/log/install/vmtools_install.log
+           TOPDIR=`tar -tzf $VMTOOLS_TARBALL 2>&1 | head -1 | tr -d '/' | awk '{print $1}'`
+          
+           # Extracting Tarball 
+           tar -xzf $VMTOOLS_TARBALL -C /tmp
+
+           if [[ -n $LOGFILE ]] && [[ -n $VTS ]]; then
+              echo "`$VTS`:$0 Starting VMTools install - logs will be written to $VMTOOLS_INSTLOG" | $LOG1
+           fi
+           echo "Starting VMTools install - logs will be written to $VMTOOLS_INSTLOG"
+
+           # Running installer
+           #/tmp/${TOPDIR}/vmware-install.pl --default EULA_AGREED=yes 2>&1 >> $VMTOOLS_INSTLOG
+           /tmp/${TOPDIR}/vmware-install.pl --default EULA_AGREED=yes >> $VMTOOLS_INSTLOG 2>&1
+           RESULT=$?
+
+           if [[ $RESULT != 0 ]]; then
+              if [[ -n $LOGFILE ]] && [[ -n $VTS ]]; then
+                 echo "`$VTS`:$0 Failure: VMTools installer exited with non-zero code [$RESULT] see log for details" | $LOG1
+              fi
+              echo "Failure: VMTools installer exited with non-zero code [$RESULT] see log for details"
+           else
+              if [[ -n $LOGFILE ]] && [[ -n $VTS ]]; then
+                 echo "`$VTS`:$0 VMTools installation succeeded." | $LOG1
+              fi
+              echo "VMTools installation succeeded."
+        
+              # Set time based on Host 
+              /usr/bin/vmware-toolbox-cmd timesync enable
+
+              # Make sure NTP is off
+              if [[ -s /etc/init.d/ntpd ]]; then /sbin/chkconfig ntpd off; fi
+              if [[ -n `ps --no-header -C ntpd -o pid` ]]; then
+                 /etc/init.d/ntpd stop
+              fi
+           fi
+
+           if [[ -f /etc/init.d/vmware-tools ]]; then
+              sed -i 's/\/usr\/bin\/tpvmlpd/#\/usr\/bin\/tpvmlpd/g' /etc/init.d/vmware-tools
+           fi
+
+           ;;
+        *) if [[ -n $LOGFILE ]] && [[ -n $VTS ]]; then
+              echo "`$VTS`:$0 No tools for hardware vendor $VENDOR - nothing to do." | $LOG1
+           fi
+           echo "No tools for hardware vendor $VENDOR - nothing to do."
+           ;;
+esac
+

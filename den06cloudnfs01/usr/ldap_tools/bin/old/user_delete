@@ -1,0 +1,168 @@
+#!/bin/bash
+
+###########################################
+# Purpose: Delete a user
+# Author: SDW
+# Incept 01/07/2013
+
+# Notes: - basic LDAP authentication must already be configured and working
+#          on the server where this script is run from
+f_Usage () {
+   echo "$0 USAGE"
+   echo ""
+   echo "$0 <POSIX group name>"
+   echo ""
+   echo "   Deletes a POSIX group from the directory. If a group name is not"
+   echo "   speified on the command line, you will be prompted to provide"
+   echo "   one."
+   echo ""
+}
+
+# Set path to the location of the script no matter how it was invoked
+if [[ `echo $0 | sed 's/^.\///g'` == `basename $0` ]]; then
+   WORKDIR=`pwd`
+else
+   BASENAME=`basename $0`
+   WORKDIR=`echo $0 | sed 's/'"$BASENAME"'$//g'`
+fi
+
+cd $WORKDIR
+
+# Set some basic options for ldap searching, durrently the directory server doesn't require a binddn or a rootbinddn
+# so simple authentication should work fine
+LDAP_SEARCH="/usr/bin/ldapsearch -x -ZZ"
+UPDATE_USER=`ldapsearch -x -ZZ "(uid=$USER)" dn | grep ^dn: | sed 's/^dn:[ \t]//'`
+LDAP_MODIFY="/usr/bin/ldapmodify -x -ZZ -D \"$UPDATE_USER\""
+LDAP_BT="$LDAP_SEARCH '(ou=SUDOers)' -D \"$UPDATE_USER\" -w"
+MAXTRIES=5
+
+# Define variables
+LDIF_TMP=/eit/admin/scripts/ldap_tools/tmp/.`basename $0`.$$.ldt
+TS=`date +%Y%m%d%H%M%S`
+BACKUP_DIR=/eit/admin/scripts/ldap_tools/local_backup
+
+
+# find the ldap base
+if [[ -s /etc/ldap.conf ]]; then
+   LDC=/etc/ldap.conf
+elif [[ -s /etc/openldap/ldap.conf ]]; then
+   LDC=/etc/openldap/ldap.conf
+fi
+LDAP_BASE=`egrep -i "^base[ \t]" $LDC | sed 's/^base[ \t]//i'`
+
+if [[ -z $LDAP_BASE ]]; then
+   echo "Unable to find the base dn for LDAP - please make sure ldap is properly"
+   echo "configured on this machine.  If it IS properly configured and you're"
+   echo "still getting this error, you probably need to update the LDAP_SEARCH"
+   echo "variable in this script to something that works with the current config."
+   exit
+fi
+
+U_BASE="ou=People,$LDAP_BASE"
+
+# Get information from the user
+
+UTBD=$1
+
+# If we got a name from the command line
+if [[ -n $UTBD ]]; then
+   if [[ "$UTBD" == "--help" ]]; then
+      f_Usage
+      exit
+   fi
+
+   # Verify the service account exists
+   if [[ -z `$LDAP_SEARCH -b $U_BASE "(&(objectClass=posixaccount)(uid=${UTBD}))" uid | grep "^uid:"` ]]; then
+      echo "ERROR: User \"$UTBD\" not found in the directory."
+      exit
+   else
+      UTBDDN=`$LDAP_SEARCH -b $U_BASE "(&(objectClass=posixaccount)(uid=${UTBD}))" dn | sed ':a;N;$!ba;s/\n //g' | grep $UTBD | grep ^dn: | sed 's/^dn: //g'`
+   fi
+
+# If we did NOT get a name from the command line
+else
+
+   # Prompt the user for a name
+   VC2=FALSE
+   while [[ $VC2 == FALSE ]]; do
+      unset GUTBD
+      read -p "What is the name of the User Account to be deleted?: " GUTBD
+
+      # Check for non-existence - retry on error
+      if [[ -z `$LDAP_SEARCH -b $U_BASE "(&(objectClass=posixaccount)(uid=${GUTBD}))" uid | grep "^uid:"` ]]; then
+         echo "ERROR: User Account \"$GUTBD\" not found in the directory."
+         read -p "Press Enter to try a different name, Ctrl+C to cancel." JUNK
+         tput cuu1; tput el; tput cuu1; tput el; tput uuu1; tput el
+      else
+         VC2=TRUE
+         UTBD=$GUTBD
+         UTBDDN=`$LDAP_SEARCH -b $U_BASE "(&(objectClass=posixaccount)(uid=${UTBD}))" dn | sed ':a;N;$!ba;s/\n //g' | grep $UTBD | grep ^dn: | sed 's/^dn: //g'`
+      fi
+   done
+fi
+
+
+
+# Create a backup file for the service account
+if [[ ! -d $BACKUP_DIR ]]; then
+   mkdir -p $BACKUP_DIR
+fi
+LDIF_BAK=${BACKUP_DIR}/user_deleted_${UTBD}_${TS}.ldif
+$LDAP_SEARCH -b $U_BASE "(&(objectClass=posixaccount)(uid=${UTBD}))" 2>&1 | egrep -v '^#|^$|^search|^result' >> $LDIF_BAK
+
+if [[ ! -s $LDIF_BAK ]]; then
+   echo "Error: there was a problem creating the backup file for $UTBD"
+   exit
+#else
+#   echo "Backup created: $LDIF_BAK"
+fi
+
+# Create ldif to delete the netgroup
+cat << EOF > $LDIF_TMP
+dn: $UTBDDN
+changetype: delete
+EOF
+
+# Ask for confirmation
+echo ""
+echo "You have requested to delete:"
+echo "   $UTBDDN"
+echo ""
+read -p "Is this correct? (Enter Y to delete, anything else to quit): " CONFIRM
+if [[ -z `echo $CONFIRM | grep -i "^Y$"` ]]; then
+   echo "Action Cancelled."
+else
+
+   # Verify LDAP password
+   VP=FALSE
+   TRIES=0
+   while [[ $VP == FALSE ]] && [[ $TRIES -le $MAXTRIES ]]; do
+      read -sp "LDAP Password ($UPDATE_USER): " UUP
+      echo "$LDAP_BT \"$UUP\"" | /bin/bash 2>&1 >/dev/null
+      if [[ $? != 0 ]]; then
+         unset UUP
+         let TRIES=$TRIES+1
+      else
+         echo ""
+         VP=TRUE
+      fi
+   done
+
+
+   echo "$LDAP_MODIFY -w \"$UUP\" -a -f $LDIF_TMP " | /bin/bash
+   if [[ $? != 0 ]]; then
+      echo "There was an error adding the object(s)"
+      echo "The command that failed was:"
+      echo "   $LDAP_MODIFY -W -a -f $LDIF_TMP"
+      echo ""
+      exit
+   fi
+fi
+/bin/rm $LDIF_TMP
+
+if [[ -z `$LDAP_SEARCH -b $U_BASE "(&(objectClass=posixaccount)(uid=${UTBD}))" uid | grep "^uid:"` ]]; then
+   echo "User Account \"$UTBD\" was successfully removed from the directory."
+else
+   echo "User Account \"$UTBD\" was NOT removed successfully."
+fi
+

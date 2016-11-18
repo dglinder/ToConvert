@@ -1,0 +1,286 @@
+#!/bin/bash
+
+# Prepares a RHEL instance to be converted into a VM template
+
+if [[ $EUID != 0 ]]; then
+   echo "FAILURE: This script must be run as root or with equivalent privilege."
+   echo "         This system HAS NOT been configured for LDAP."
+   exit 2
+fi
+
+
+
+############### REMOVE PERSISTENT NET RULES ###################
+PRF=/etc/udev/rules.d/70-persistent-net.rules
+if [[ -f $PRF ]]; then
+   echo > $PRF
+fi
+
+###############################################################
+
+############### REMOVE SSH HOST KEYS # ########################
+HOSTIDFILES="
+/etc/ssh/ssh_host_dsa_key.pub
+/etc/ssh/ssh_host_key.pub
+/etc/ssh/ssh_host_key
+/etc/ssh/ssh_host_rsa_key
+/etc/ssh/ssh_host_rsa_key.pub
+/etc/ssh/ssh_host_dsa_key
+"
+
+for HIDF in $HOSTIDFILES; do
+   if [[ -f $HIDF ]]; then
+      /bin/rm $HIDF
+   fi
+done
+###############################################################
+
+
+############### CLEAR LOG and HISTORY #########################
+HISTFILES="
+/root/.sh_history
+/root/.bash_history
+"
+for HF in $HISTFILES; do
+   if [[ -f $HF ]]; then
+      echo > $HF
+   fi
+done
+
+# Shut down syslog to begin removal
+if [[ -f /etc/init.d/rsyslog ]]; then
+   SLD=/etc/init.d/rsyslog
+else
+   SLD=/etc/init.d/syslog
+fi
+
+$SLD stop
+
+LOGFILES="
+/var/log/debug/debug
+/var/log/mail/mail
+/var/log/app/app
+/var/log/admin_msg/admin
+/var/log/error/error
+/var/log/messages
+/var/log/secure
+/var/log/cron
+/var/log/boot.log
+/var/log/wtmp
+"
+
+for LF in $LOGFILES; do
+   if [[ -f $LF ]]; then
+      /bin/rm ${LF}*
+   fi
+done
+
+#$SLD start
+
+###############################################################
+
+################ CREATE CLONECHECK RC SCRIPT ##################
+
+# Optional: Add ONE user netgroup to the machine netgroup automatically
+#ADD_USER_NG=ITCALL_users
+ADD_USER_NG=
+
+# Optional: Add this server to ONE Host netgroup automatically 
+# NOTE: the "machine account manager" ccount must have "write" permissions
+#       specifically granted for the Host netgroup for this to work
+#ADD_TO_HOST_NG=ITCVCD_hosts
+ADD_TO_HOST_NG=
+
+# Create the RC script 
+RCN=clonecheck
+RCP=/etc/init.d
+RCSCRIPT=${RCP}/${RCN}
+
+cat << EOF > $RCSCRIPT
+#!/bin/sh
+
+# the following is the LSB init header
+#
+### BEGIN INIT INFO
+# Provides: clonecheck
+# Required-Start: network
+# Required-Stop: network
+# Default-Start: 2 3 4 5
+# Default-Stop: 0 1 6
+# Short-Description: runs post-clone steps as appropriate
+# Description: This script checks to see if this OS is a clone, then runs post-cloning tasks
+### END INIT INFO
+
+# the following is chkconfig init header
+#
+# clonecheck: run post in case of clone
+#
+# chkconfig: 345 99 01
+# description:  This is a script for running post-cloning actions
+#
+
+
+f_Usage() {
+
+   echo "Usage: \$0 [start]"
+
+}
+
+
+f_Start () {
+   
+   echo "Starting \$0"
+
+   # Read some values for comparison
+
+   # Get the recorded and current serial numbers
+   RECSERIAL=\`grep "^ Serial#:" /etc/motd | sed 's/^ Serial#: //;s/^ //;s/ $//'i\`
+   CURSERIAL=\`dmidecode | awk /"System Information"/,/"Serial Number"/ | grep "Serial Number" | awk -F':' '{print \$NF}' | sed 's/^ //;s/ $//'\`
+
+   # Get the recorded and current hostname
+   RECHN=\`grep "^ Name:" /etc/motd | awk '{print \$2}' | awk -F'.' '{print \$1}'\`
+   CURHN=\`hostname -s\`
+
+   if [[ "\$RECSERIAL" != "\$CURSERIAL" ]]; then
+      echo "I think I'm a clone now!"
+      
+      # Disable LDAP logins to prevent authentication via "borrowed" machine netgroup
+      ESA=/etc/security/access.conf
+      chattr -i \$ESA
+      sed -i '/^+:@/d' \$ESA
+      chattr +i \$ESA
+
+      # Make sure the hostname has also been changed before we do anything
+      if [[ "\$RECHN" == "\$CURHN" ]]; then
+         logger -t clonecheck -s "server serial number has changed but hostname has not, LDAP logins will not work until the hostname is updated"
+      else
+         # Re-run the setup_ldap.sh script to reconfigure and re-enable
+         /opt/setup_ldap.sh
+   
+         # Define LDAP parameters
+         LDAP_MODIFY="/usr/bin/ldapmodify -x -D \\"cn=machine account manager,cn=config\\""
+         LDAP_SEARCH="/usr/bin/ldapsearch -x"
+         LDIF_TMP=/tmp/ldpsldt.\$\$
+         NG_BASE=\`\$LDAP_SEARCH '(ou=Netgroups)' | grep "dn: ou" | awk '{print \$2}'\`
+         MNG=\`hostname -s\`_machine
+
+         # These variables are optional and used for self-service cloning
+         # They will be used to add a specified user netgroup to the machine netgroup
+         # and/or add this server as a member of a specified host netgroup
+         ADD_USER_NG_TO_LOGON=$ADD_USER_NG
+
+         # Note: in order to be added to a specified host netgroup, the machine account manager
+         #       DN must specifically be granted "write" permission via aci to the 
+         #       specified host netgroup.  This must be done by an LDAP admin before
+         #       this operation will work.
+         MAKE_MEMBER_HOST_NG=$ADD_TO_HOST_NG
+
+         # Clear the tmp file if it exists
+         echo > \$LDIF_TMP
+         
+
+         # Validate that setup_ldap.sh successfully configured the directory and server
+
+         MNG_PRESENT=FALSE
+         if [[ -n \$NG_BASE ]]; then
+            if [[ -n \`\$LDAP_SEARCH -b \$NG_BASE "(cn=\$MNG)" cn | grep -i ^cn:\` ]]; then
+               MNG_PRESENT=TRUE
+            fi
+         fi
+
+
+         if [[ -n \`grep ^+:@ \$ESA\` ]] && [[ \$MNG_PRESENT == TRUE ]]; then
+            # If setup_ldap.sh completed update the motd and process any additional
+            # ldap work
+            if [[ -f /etc/motd.info ]]; then
+               /maint/scripts/setup_motd.sh
+
+               # See if we're adding a specific user NG
+               if [[ -n \$ADD_USER_NG_TO_LOGON ]]; then
+             
+                  # Validate the user NG
+                  if [[ -n \`\$LDAP_SEARCH -b ou=Users,\$NG_BASE "(cn=\$ADD_USER_NG_TO_LOGON)" cn | grep -i ^cn:\` ]]; then
+
+                     # If the user NG exists, and it's not already a member of the machine netgroup, then add it
+                     if [[ -z \`\$LDAP_SEARCH -b \$NG_BASE "(&(cn=\$MNG)(memberNisNetgroup=\$ADD_USER_NG_TO_LOGON))" cn | grep ^cn:\` ]]; then
+                        echo "dn: cn=\$MNG,ou=Machines,\$NG_BASE" >> \$LDIF_TMP
+                        echo "changetype: modify" >> \$LDIF_TMP
+                        echo "add: memberNisNetgroup" >> \$LDIF_TMP
+                        echo "memberNisNetgroup: \$ADD_USER_NG_TO_LOGON" >> \$LDIF_TMP
+                        echo "" >> \$LDIF_TMP
+                     fi
+                 else
+                    logger -t clonecheck -s "custom user netgroup \$ADD_USER_NG_TO_LOGON not found in directory, not adding."
+                 fi
+              fi
+
+              # See if we're adding this host to a hosts netgroup
+              if [[ -n \$MAKE_MEMBER_HOST_NG ]]; then
+                 
+                 # Validate the host NG exists
+                 HNGDN=\`\$LDAP_SEARCH -b ou=Hosts,\$NG_BASE "(cn=\$MAKE_MEMBER_HOST_NG)" dn | sed ':a;N;$!ba;s/\n //g'| grep ^dn: | sed 's/^dn: //g'\`
+                 if [[ -n \$HNGDN ]]; then
+                 
+                    # If the host NG exists and this host isn't already a member, then add it
+                    if [[ -z \`\$LDAP_SEARCH -b \$NG_BASE "(cn=\$MAKE_MEMBER_HOST_NG)" nisNetgroupTriple | grep ^nisNetgroupTriple: | grep "(\${CURHN},"\` ]]; then
+                       echo "dn: \$HNGDN" >> \$LDIF_TMP
+                       echo "changetype: modify" >> \$LDIF_TMP
+                       echo "add: nisNetgroupTriple" >> \$LDIF_TMP
+                       echo "nisNetgroupTriple: (\`hostname -s\`,-,)" >> \$LDIF_TMP
+                       echo "" >> \$LDIF_TMP
+                    fi
+                 else
+                    logger -t clonecheck -s "custom host netgroup \$MAKE_MEMBER_HOST_NG not found in directory, not adding."
+                 fi
+
+               fi
+               # If we populated $LDIF_TMP then try to add it
+               if [[ -s \$LDIF_TMP ]]; then
+                  echo "\$LDAP_MODIFY -a -w J0inM3 -f \$LDIF_TMP " | /bin/bash
+               fi
+               # Clean up the temp file
+               sleep 1
+               /bin/rm \$LDIF_TMP
+            fi
+         fi 
+      fi 
+   fi
+}
+
+f_Stop () {
+
+   echo "This script is not persistent. The stop option is for API compliance."
+}
+   
+
+if test \$# != 1; then
+    f_Usage
+    RETVAL=0
+else
+   case "\$1" in
+
+       --help) f_Usage
+               RETVAL=0
+               ;;
+        start) f_Start
+               RETVAL=\$?
+               ;;
+         stop) f_Stop
+               RETVAL=\$?
+               ;;
+            *) f_Usage
+               RETVAL=0
+               ;;
+   esac
+fi
+exit \$RETVAL
+
+EOF
+
+chmod 755 $RCSCRIPT
+
+/sbin/chkconfig $RCN on
+
+
+
+###############################################################

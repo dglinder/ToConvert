@@ -1,0 +1,215 @@
+#!/bin/bash
+
+# Prepares a RHEL instance to be converted into a VM template
+
+if [[ $EUID != 0 ]]; then
+   echo "FAILURE: This script must be run as root or with equivalent privilege."
+   echo "         This system HAS NOT been configured for LDAP."
+   exit 2
+fi
+
+
+
+############### REMOVE PERSISTENT NET RULES ###################
+PRF=/etc/udev/rules.d/70-persistent-net.rules
+if [[ -f $PRF ]]; then
+   echo > $PRF
+fi
+
+###############################################################
+
+############### REMOVE SSH HOST KEYS # ########################
+HOSTIDFILES="
+/etc/ssh/ssh_host_dsa_key.pub
+/etc/ssh/ssh_host_key.pub
+/etc/ssh/ssh_host_key
+/etc/ssh/ssh_host_rsa_key
+/etc/ssh/ssh_host_rsa_key.pub
+/etc/ssh/ssh_host_dsa_key
+"
+
+for HIDF in $HOSTIDFILES; do
+   if [[ -f $HIDF ]]; then
+      /bin/rm $HIDF
+   fi
+done
+###############################################################
+
+
+############### CLEAR LOG and HISTORY #########################
+HISTFILES="
+/root/.sh_history
+/root/.bash_history
+"
+for HF in $HISTFILES; do
+   if [[ -f $HF ]]; then
+      echo > $HF
+   fi
+done
+
+# Shut down syslog to begin removal
+if [[ -f /etc/init.d/rsyslog ]]; then
+   SLD=/etc/init.d/rsyslog
+else
+   SLD=/etc/init.d/syslog
+fi
+
+$SLD stop
+
+LOGFILES="
+/var/log/debug/debug
+/var/log/mail/mail
+/var/log/app/app
+/var/log/admin_msg/admin
+/var/log/error/error
+/var/log/messages
+/var/log/secure
+/var/log/cron
+/var/log/boot.log
+/var/log/wtmp
+"
+
+for LF in $LOGFILES; do
+   if [[ -f $LF ]]; then
+      /bin/rm ${LF}*
+   fi
+done
+
+#$SLD start
+
+###############################################################
+
+################ CREATE CLONECHECK RC SCRIPT ##################
+
+# Group Authorized To Add Users
+AAG=eitldjap
+
+# Create the RC script
+RCN=clonecheckd
+RCP=/etc/init.d
+RCSCRIPT=${RCP}/${RCN}
+
+cat << EOF > $RCSCRIPT
+#!/bin/sh
+
+# the following is the LSB init header
+#
+### BEGIN INIT INFO
+# Provides: clonecheck
+# Required-Start: network
+# Required-Stop: network
+# Default-Start: 2 3 4 5
+# Default-Stop: 0 1 6
+# Short-Description: runs post-clone steps as appropriate
+# Description: This script checks to see if this OS is a clone, then runs post-cloning tasks
+### END INIT INFO
+
+# the following is chkconfig init header
+#
+# clonecheck: run post in case of clone
+#
+# chkconfig: 345 99 01
+# description:  This is a script for running post-cloning actions
+#
+
+
+f_Usage() {
+
+   echo "Usage: \$0 [start]"
+
+}
+
+
+f_Start () {
+
+   echo "Starting \$0"
+
+   # Read some values for comparison
+
+   # Get the recorded and current serial numbers
+   RECSERIAL=\`grep "^SERIAL=" /etc/sso | sed 's/^SERIAL=//;s/^ //;s/ $//'i\`
+   CURSERIAL=\`dmidecode | awk /"System Information"/,/"Serial Number"/ | grep "Serial Number" | awk -F':' '{print \$NF}' | sed 's/^ //;s/ $//'\`
+   if [[ -z \$CURSERIAL ]]; then
+      logger -t clonecheck -s "error reading Serial/UUID, clonecheck aborted."
+      exit
+   fi
+
+   # Get the recorded and current hostname
+   RECHN=\`grep "^NAME=" /etc/sso | sed 's/^NAME=//;s/^ //;s/ $//'i\`
+   CURHN=\`hostname -s\`
+
+   if [[ "\$RECSERIAL" != "\$CURSERIAL" ]]; then
+      echo "I think I'm a clone now!"
+
+      # Open access.conf for writing
+      ESA=/etc/security/access.conf
+      chattr -i \$ESA
+
+
+      # Disable LDAP logins to prevent authentication via "borrowed" machine netgroup
+      sed -i '/^+:@/d' \$ESA
+
+      # Enable the Authorized add group to log in (will be disabled when the new machine is added)
+      if [[ -z \`grep '^+' \$ESA | grep ':ALL\$' | grep $AAG | grep root\` ]]; then
+         ALLOWLINE=\`grep '^+' \$ESA | grep ':ALL$' | grep root\`
+         NEWALLOWLINE=\`echo \$ALLOWLINE | sed "s/:ALL\$/ $AAG:ALL/"\`
+         sed -i "s/\$ALLOWLINE/\$NEWALLOWLINE/" \$ESA
+      fi
+
+      # Close access.conf for writing
+      chattr +i \$ESA
+
+      # Add a trigger to /etc/profile to prompt the next person who logs in
+      # to rejoin the domain
+      if [[ ! -s /etc/issue.orig ]]; then cp -rp /etc/issue /etc/issue.orig; fi
+      echo "#########################[ ATTENTION ]#########################" > /etc/issue
+      echo "" >> /etc/issue
+      echo "The next user to log in will be required to complete one-time" >> /etc/issue
+      echo "set up of this clone. LDAP credentials are required." >> /etc/issue
+      echo "" >> /etc/issue
+      echo "#########################[ ATTENTION ]#########################" >> /etc/issue
+      echo "" >> /etc/issue
+      echo "echo \\"kill -9 \$\$;echo clonecheck_unpriv\\" | at now +2 minutes" >> /etc/profile
+      echo "/usr/ldap_tools/bin/clonecheck_unpriv" >> /etc/profile
+
+   fi
+}
+
+f_Stop () {
+
+   echo "This script is not persistent. The stop option is for API compliance."
+}
+
+
+if test \$# != 1; then
+    f_Usage
+    RETVAL=0
+else
+   case "\$1" in
+
+       --help) f_Usage
+               RETVAL=0
+               ;;
+        start) f_Start
+               RETVAL=\$?
+               ;;
+         stop) f_Stop
+               RETVAL=\$?
+               ;;
+            *) f_Usage
+               RETVAL=0
+               ;;
+   esac
+fi
+exit \$RETVAL
+
+EOF
+
+chmod 755 $RCSCRIPT
+
+/sbin/chkconfig $RCN on
+
+
+
+###############################################################
+

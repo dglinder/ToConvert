@@ -1,0 +1,930 @@
+#!/bin/bash
+
+###########################################
+# Purpose: Create Sudoers OU and default role
+# Author: SDW
+# Incept 06/09/2012
+
+# Notes: - basic LDAP authentication must already be configured and working
+#        - by default SUDOers will be placed at the base dn of the directory server
+
+f_Usage() {
+
+   echo "USAGE:"
+   echo ""
+   echo "   $0"
+   echo ""
+   echo "      OR"
+   echo ""
+   echo "   $0 -f <role file>"
+   echo ""
+   echo "      OR"
+   echo ""
+   echo "   $0 -b"
+   echo ""
+   echo "        Invoking the command without arguments will "
+   echo "        use interactive mode where you will be prompted"
+   echo "        for the elements from which to build the role."
+   echo ""
+   echo "    -f  Allows you to create a SUDO role from a pre-formatted"
+   echo "        file <role file>. "
+   echo ""
+   echo "    -b  Creates an empty role file with comments."
+   echo ""
+
+}
+
+# Set path to the location of the script no matter how it was invoked
+if [[ `echo $0 | sed 's/^.\///g'` == `basename $0` ]]; then
+   WORKDIR=`pwd`
+else
+   BASENAME=`basename $0`
+   WORKDIR=`echo $0 | sed 's/'"$BASENAME"'$//g'`
+fi
+
+cd $WORKDIR
+
+# Set some basic options for ldap searching, durrently the directory server doesn't require a binddn or a rootbinddn
+# so simple authentication should work fine
+LDAP_SEARCH="/usr/bin/ldapsearch -x -ZZ"
+UPDATE_USER=`ldapsearch -x -ZZ "(uid=$USER)" dn | grep ^dn: | sed 's/^dn:[ \t]//'`
+LDAP_MODIFY="/usr/bin/ldapmodify -x -ZZ -D \"$UPDATE_USER\""
+LDAP_BT="$LDAP_SEARCH '(ou=SUDOers)' -D \"$UPDATE_USER\" -w"
+MAXTRIES=5
+
+
+# Set some terminal options
+set_bold=`tput bold`
+set_norm=`tput sgr0`
+
+# Define some variables
+LDIF_TMP=/eit/admin/scripts/ldap_tools/tmp/.`basename $0`.$$.ldt
+TEMPLFILE=./empty.role
+BACKUP_DIR=/eit/admin/scripts/ldap_tools/local_backup
+TS=`date +%Y%m%d%H%M%S`
+
+# find the ldap base
+if [[ -s /etc/ldap.conf ]]; then
+   LDC=/etc/ldap.conf
+elif [[ -s /etc/openldap/ldap.conf ]]; then
+   LDC=/etc/openldap/ldap.conf
+fi
+LDAP_BASE=`egrep -i "^base[ \t]" $LDC | sed 's/^base[ \t]//i'`
+
+if [[ -z $LDAP_BASE ]]; then 
+   echo "Unable to find the base dn for LDAP - please make sure ldap is properly"
+   echo "configured on this machine.  If it IS properly configured and you're"
+   echo "still getting this error, you probably need to update the LDAP_SEARCH"
+   echo "variable in this script to something that works with the current config."
+   exit
+fi
+
+if [[ -z $UPDATE_USER ]]; then
+   echo "Unable to locate the correct DN for your user account [$USER]."
+   echo "You must be a member of the domain in order to use this script."
+   exit
+fi
+
+# Look for a "SUDOers" OU at the base level
+SUDO_BASE=`$LDAP_SEARCH '(ou=SUDOers)' | grep "dn: ou" | awk '{print $2}'`
+
+# Look for a "Netgroups" OU at the base level
+NG_BASE=`$LDAP_SEARCH '(ou=Netgroups)' | grep "dn: ou" | awk '{print $2}'`
+
+# If there is no SUDOers OU then we need to create both the OU and the defaults cn
+if [[ -z $SUDO_BASE ]]; then 
+  echo "The directory does not appear to be configured for SUDOers"
+  echo "exiting."
+  exit
+fi
+
+if [[ $# == 0 ]]; then
+   MODE=INTERACTIVE
+elif [[ $# == 1 ]]; then
+   if [[ "$1" == "-b" ]]; then
+      MODE=GENTEMPLATE
+   else
+      f_Usage
+      exit
+   fi
+elif [[ $# == 2 ]]; then
+   if [[ "$1" == "-f" ]]; then
+      MODE=IMPORT
+      IMPORTFILE=$2
+   else
+      f_Usage
+      exit
+   fi
+else
+   f_Usage
+   exit
+fi
+
+
+if  [[ $MODE == IMPORT ]]; then
+
+   # Start with the assumption that everything checks out.  Any one
+   # Failure will change this value
+   FAILURE=NO
+
+   # Make sure the importfile exists and has data
+   if [[ ! -s $IMPORTFILE ]]; then
+      echo "Error: $IMPORTFILE does not exist or does not contain data."
+      FAILURE=YES
+   else
+
+      # Check name
+      echo "Checking Name"
+      RRN=`grep "^ROLE_NAME:" $IMPORTFILE | sed 's/^ROLE_NAME: //; s/^ROLE_NAME://'`
+      # Make sure the role name was defined
+      if [[ -z $RRN ]]; then
+         echo "Error: ROLE_NAME element not found in $IMPORTFILE"
+         FAILURE=YES
+      fi
+      # Remove any unsafe characters and the _role if it was added
+      SRRN=`echo $RRN | tr -d '\`!@$%^&*()+=/|[]{}:\ ;"\\'\''' | sed 's/_role$//'`
+      # Create the role name string
+      ROLE_NAME="${SRRN}_role"
+   
+      # Check for duplicates
+      if [[ -n `$LDAP_SEARCH -b $SUDO_BASE "(cn=${ROLE_NAME})" 2>&1 | egrep -v '^#|^$|^search|^result'` ]]; then
+         echo "Error: a SUDO role called \"$ROLE_NAME\" already exists."
+         FAILURE=YES
+      fi
+   
+      # Check users list
+      if [[ -z `grep "^USER:" $IMPORTFILE | sed 's/^USER: //g; s/^USER://g'` ]]; then
+         echo "Error: no USER element(s) found in $IMPORTFILE"
+         echo "       there must be at least one USER: specified."
+         FAILURE=YES
+      else
+   
+         # Check each user defined
+         for SU in `grep "^USER:" $IMPORTFILE | sed 's/^USER: //g; s/^USER://g'`; do
+            if [[ -z `$LDAP_SEARCH -b $NG_BASE "(cn=$SU)" cn | grep "^cn:"` ]]; then
+               echo "Error: \"$SU\" does not exist in the directory."
+               FAILURE=YES
+            elif [[ -z `echo $SU | grep "_users$"` ]]; then
+               echo "Error: \"$SU\" is not a user netgroup."
+            else
+              if [[ -z $SUS ]]; then
+                 SUS=$SU
+              else
+                 SUS="$SUS,$SU"
+              fi
+            fi
+      
+         done
+      fi
+   
+      # Check hosts list
+      if [[ -z `grep "^HOST:" $IMPORTFILE | sed 's/^HOST: //g; s/^HOST://g'` ]]; then
+         echo "Error: no HOST element(s) found in $IMPORTFILE"
+         echo "       there must be at least one HOST: specified."
+         FAILURE=YES
+      else
+   
+         for SH in `grep "^HOST:" $IMPORTFILE | sed 's/^HOST: //g; s/^HOST://g'`; do
+            if [[ -z `$LDAP_SEARCH -b $NG_BASE "(cn=$SH)" cn | grep "^cn:"` ]]; then
+                  echo "Error: \"$SH\" does not exist in the directory."
+               FAILURE=YES
+            elif [[ -z `echo $SH | egrep "_hosts$|_machine$"` ]]; then
+               echo "Error: HOST must be either a host or machine netgroup, $SH is invalid."
+               FAILURE=YES
+            else
+              if [[ -z $SHS ]]; then
+                 SHS=$SH
+              else
+                 SHS="$SHS,$SH"
+              fi
+            fi
+ 
+         
+#            if [[ -z `$LDAP_SEARCH -b $NG_BASE "(nisNetgroupTriple=\(,$SH,\))" nisNetgroupTriple | grep "^nisNetgroupTriple:" | head -1` ]]; then
+#               if [[ $SH != ALL ]]; then
+#                  echo "Error: \"$SH\" does not exist in the directory."
+#                  FAILURE=YES
+#               else
+#                  SHS=$SH
+#               fi
+#            elif [[ -n `echo $SH | egrep "_hosts$|_machine$"` ]]; then
+#               echo "Error: Netgroups are not currently supported for SUDO hosts."
+#               FAILURE=YES
+#            else
+#              if [[ -z $SHS ]]; then
+#                 SHS=$SH
+#              else
+#                 SHS="$SHS,$SH"
+#              fi
+#            fi
+#      
+         done
+      fi
+   
+      # Read in password requirement - technically this is optional
+      # so unless we get a no, we'll assume a yes
+   
+      SPR=`grep "^ASKPASSWORD:" $IMPORTFILE | sed 's/^ASKPASSWORD: //; s/^ASKPASSWORD://'`
+      if [[ -n `echo $SPR | grep -i 'NO'` ]]; then
+         SPR=NO
+      else
+         SPR=YES
+      fi
+
+      # Read in freeform options from the file
+      if [[ -n `grep "^OPTION:" $IMPORTFILE` ]]; then
+         for SFO in `grep "^OPTION:" $IMPORTFILE | sed 's/^OPTION: //g; s/^OPTION://g'`; do
+            if [[ -z $SFOS ]]; then
+               SFOS=$SFO
+            else
+               SFOS="$SFOS,$SFO"
+            fi
+         done
+      fi
+   
+      # Not really going to do any syntax checking on the commands, but we'll make
+      # sure there's at least one defined.
+   
+      if [[ -z `grep "^COMMAND:" $IMPORTFILE` ]]; then
+         echo "Error: no COMMAND element(s) found in the file. There must"
+         echo "       be at least one COMMAND: specified."
+         FAILURE=YES
+      fi
+
+      # Check for duplicate lines - LDAP ADD will fail even on arbitrary fields
+      # If the same value is specified more than once for any attribute
+      if [[ -n `cat $IMPORTFILE | uniq -d` ]]; then
+         echo "Error: duplicate instances of the following line detected"
+         cat $IMPORTFILE | uniq -d | sed 's/^/       /g'
+         FAILURE=YES
+      fi
+   
+   fi
+   
+   # Now, check to see if we failed at any point
+   if [[ $FAILURE == YES ]]; then
+      echo ""
+      echo "Verification failed, please address the errors above and try again."
+      exit
+   fi
+
+   echo "Verification passed.  Applying update."
+
+   # Build our LDIF based on the new information, we'll be replacing the values
+   # with whatever was read in from the edited file
+   
+   # Specify the DN of the SUDO role to be edited and specify that we're modifying it
+   echo "dn: cn=$ROLE_NAME,$SUDO_BASE" > $LDIF_TMP
+   echo "objectClass: top" >> $LDIF_TMP
+   echo "objectClass: sudorole" >> $LDIF_TMP
+   echo "cn: $ROLE_NAME" >> $LDIF_TMP
+   
+   # Add users
+   for SU in `echo $SUS | sed 's/,/ /g'`; do
+      echo "sudoUser: +$SU" >> $LDIF_TMP
+   done
+
+   # Add hosts
+   for SH in `echo $SHS | sed 's/,/ /g'`; do
+      if [[ $SH == ALL ]]; then
+         echo "sudoHost: $SH" >> $LDIF_TMP
+      else
+         echo "sudoHost: +$SH" >> $LDIF_TMP
+      fi
+   done
+   
+   # Add commands
+   grep "^COMMAND:" $IMPORTFILE | sed 's/^COMMAND:/sudoCommand:/g' >> $LDIF_TMP
+   
+   # Add options
+   if [[ $SPR == NO ]]; then
+      echo 'sudoOption: !authenticate' >> $LDIF_TMP
+   else
+      echo 'sudoOption: authenticate' >> $LDIF_TMP
+   fi
+
+   if [[ -n $SFOS ]]; then
+      for SFO in `echo $SFOS | sed 's/,/ /g'`; do
+         echo "sudoOption: $SFO" >> $LDIF_TMP
+      done
+   fi
+
+   # Add description
+   GDESC=`grep "^DESCRIPTION:" $IMPORTFILE | sed 's/^DESCRIPTION://'` 
+   SDESC=`echo $GDESC | tr -d '\`!@$%^&*()+=/|[]{}:;"\\'\'''`
+   if [[ -n $SDESC ]]; then
+      echo "Description: $SDESC" >> $LDIF_TMP
+   fi
+
+
+   # Import complete
+   
+   
+elif [[ $MODE == GENTEMPLATE ]]; then
+
+   echo "###ROLE NAME ##########################################" > $TEMPLFILE
+   echo "# ROLE_NAME should be short, but descriptive enough to explain" >> $TEMPLFILE
+   echo "# its function." >> $TEMPLFILE
+   echo "#" >> $TEMPLFILE
+   echo "# example:" >> $TEMPLFILE
+   echo "#    ROLE_NAME: WebAdmin_role" >> $TEMPLFILE
+   echo "#" >> $TEMPLFILE
+   echo "# Note: the _role suffix will be added to the role name" >> $TEMPLFILE
+   echo "#       automatically whether you specify it in this file" >> $TEMPLFILE
+   echo "#       or not." >> $TEMPLFILE
+   echo "#######################################################" >> $TEMPLFILE
+   echo "#ROLE_NAME:" >> $TEMPLFILE
+   echo "" >> $TEMPLFILE
+   
+   # Add the user list
+   
+   echo "##USERS##############################################" >> $TEMPLFILE
+   echo "# You may specify as many USER lines as you like" >> $TEMPLFILE
+   echo "# USER must refer to a user netgroup, not an individual user" >> $TEMPLFILE
+   echo "# Use a separate line for each user netgroup" >> $TEMPLFILE
+   echo "#" >> $TEMPLFILE
+   echo "# example:" >> $TEMPLFILE
+   echo "#    USER: UnixAdmin_users" >> $TEMPLFILE
+   echo "#    USER: StorageAdmin_users" >> $TEMPLFILE
+   echo "#####################################################" >> $TEMPLFILE
+   echo "#USER:" >> $TEMPLFILE
+   echo "" >> $TEMPLFILE
+   
+   # Add the host list
+   
+   echo "##HOSTS##############################################" >> $TEMPLFILE
+   echo "# You may specify as many HOST lines as you like" >> $TEMPLFILE
+   echo "# HOST must be the name of a host or machine netgroup" >> $TEMPLFILE
+   echo "# Use a separate line for each HOST" >> $TEMPLFILE
+   echo "# You may use the keyword "ALL" to specify that this" >> $TEMPLFILE
+   echo "# role may be used anywhere." >> $TEMPLFILE
+   echo "#" >> $TEMPLFILE
+   echo "# example 1:" >> $TEMPLFILE
+   echo "#    HOST: Test_hosts" >> $TEMPLFILE
+   echo "#" >> $TEMPLFILE
+   echo "# example 2: " >> $TEMPLFILE
+   echo "#    HOST: ALL" >> $TEMPLFILE
+   echo "#####################################################" >> $TEMPLFILE
+   echo "#HOST:" >>$TEMPLFILE
+   echo "" >> $TEMPLFILE
+   
+   # Add the command list
+   
+   echo "##COMMANDS###########################################" >> $TEMPLFILE
+   echo "# You may specify as many COMMAND lines as you like" >> $TEMPLFILE
+   echo "# Use a separate line for each individual command" >> $TEMPLFILE
+   echo "# Remember to use full paths for commands" >> $TEMPLFILE
+   echo "# You may use the keyword "ALL" to specify that" >> $TEMPLFILE
+   echo "# this role will enable the user to execute any command." >> $TEMPLFILE
+   echo "# The ALL keyword should be used sparingly as it effectively" >> $TEMPLFILE
+   echo "# gives complete root access via the role." >> $TEMPLFILE
+   echo "# " >> $TEMPLFILE
+   echo "# You may also deny specific commands by prefixing them" >> $TEMPLFILE
+   echo "# with the ! operator - there must be no space between the" >> $TEMPLFILE
+   echo "# ! and the command. This is most useful in conjunction with" >> $TEMPLFILE
+   echo "# the ALL keyword." >> $TEMPLFILE
+   echo "#" >> $TEMPLFILE
+   echo "# example 1: " >> $TEMPLFILE
+   echo "#    COMMAND: /usr/bin/whoami " >> $TEMPLFILE
+   echo "#    COMMAND: /etc/init.d/nscd re* " >> $TEMPLFILE
+   echo "#" >> $TEMPLFILE
+   echo "# example 2: " >> $TEMPLFILE
+   echo "#    COMMAND: ALL " >> $TEMPLFILE
+   echo "#" >> $TEMPLFILE
+   echo "# example 3: " >> $TEMPLFILE
+   echo "#    COMMAND: ALL " >> $TEMPLFILE
+   echo "#    COMMAND: !/bin/su -" >> $TEMPLFILE
+   echo "#    COMMAND: !/bin/su - root" >> $TEMPLFILE
+   echo "#####################################################" >> $TEMPLFILE
+   echo "#COMMAND:" >>$TEMPLFILE
+   echo "" >> $TEMPLFILE
+   
+   # Add the password ask
+   
+   echo "##REQUIRE PASSWORD###################################" >> $TEMPLFILE
+   echo "# Should the user be asked for a password when" >> $TEMPLFILE
+   echo "# executing the commands in this role with sudo?" >> $TEMPLFILE
+   echo "# Options are "YES" or "NO"" >> $TEMPLFILE
+   echo "# Default is "YES"" >> $TEMPLFILE
+   echo "#####################################################" >> $TEMPLFILE
+   echo "ASKPASSWORD: YES" >> $TEMPLFILE
+   echo "" >> $TEMPLFILE
+
+   # SUDO Option
+
+   echo "##SUDO OPTION########################################" >> $TEMPLFILE
+   echo "# Apply generic sudo options" >> $TEMPLFILE
+   echo "# Each option must be specified on its own line" >> $TEMPLFILE
+   echo "# Recommended options:" >> $TEMPLFILE
+   echo "#    Use the \"NOEXEC\" option when giving the ALL command" >> $TEMPLFILE
+   echo "#    to prevent dynamic linking.  This will prevent users" >> $TEMPLFILE
+   echo "#    from simply writing a script to get around restrictions" >> $TEMPLFILE
+   echo "#    that deny specific actions such as \"su -\"." >> $TEMPLFILE
+   echo "#    With this option turned on, scripts must be run as" >> $TEMPLFILE
+   echo "#    the user with sudo used inline." >> $TEMPLFILE
+   echo "#####################################################" >> $TEMPLFILE
+   echo "#OPTION: " >> $TEMPLFILE
+   echo "" >> $TEMPLFILE
+
+   # Ask for a description
+   echo "##ROLE DESCRIPTION###################################" >> $TEMPLFILE
+   echo "# Please provide a brief one-line description of this" >> $TEMPLFILE
+   echo "# role. Consider including both the purpose and the" >> $TEMPLFILE
+   echo "# teams that are supposed to use it.  Description is" >> $TEMPLFILE
+   echo "# optional, but strongly recommended" >> $TEMPLFILE
+   echo "#####################################################" >> $TEMPLFILE
+   echo "#DESCRIPTION: " >> $TEMPLFILE
+   echo "" >> $TEMPLFILE
+
+   echo "Created empty role file $TEMPLFILE."
+   echo "Please edit this file, then import with $0 -f to create a new role."
+   exit
+   
+elif [[ $MODE == INTERACTIVE ]]; then
+
+   # Title
+   echo "------==[Building a New SUDOers Role for LDAP]==------"
+   # Get role name, sanitize it, and add _role to create the CN for the object
+   echo ""
+   echo "------[Role Name]------"
+   echo ""
+   RND=FALSE
+   while [[ $RND == FALSE ]]; do
+      unset GRN
+      read -p "Please provide a name for the new role: " GRN
+      if [[ -n $GRN ]]; then
+         SGRN=`echo $GRN | tr -d '\`!@$%^&*()+=/|[]{}:\ ;"\\'\''' | sed 's/_role$//'`
+         ROLE_NAME="${SGRN}_role"
+         if [[ -n `$LDAP_SEARCH -b $SUDO_BASE "(cn=${ROLE_NAME})" cn | grep "^cn:"` ]]; then
+            echo "Error: a role named \"$ROLE_NAME\" already exists."
+            read -p "Press enter to try again, Ctrl+C to quit" JUNK
+            unset SGRN ROLE_NAME
+            tput cuu1; tput el; tput cuu1; tput el; tput cuu1; tput el
+         else
+            RND=TRUE
+            tput cuu1; tput el; tput cuu1; tput el; tput cuu1; tput el
+            echo "Role Name: ${set_bold}${ROLE_NAME}${set_norm}"
+         fi
+      else
+         echo "Error: role name cannot be blank"
+         read -p "Press enter to try again, Ctrl+C to quit" JUNK
+         tput cuu1; tput el; tput cuu1; tput el; tput cuu1; tput el
+      fi
+   done
+   
+   # Get a list of commands
+   echo ""
+   echo "------[SUDO Commands]------"
+   echo ""
+   echo "Provide a list of commands for $ROLE_NAME"
+   echo "finished."
+   echo ""
+   
+   GCD=FALSE
+   cc=0
+   VOFFSET=6
+   # Store each individual command as a separate array element
+   while [[ $GCD == FALSE ]]; do
+      unset GC
+      read -p "Command $((cc+1)) [leave blank to finish]: " GC
+      if [[ -n $GC ]]; then
+         CMD[$cc]=$GC
+         let cc=$cc+1
+         let VOFFSET=$VOFFSET+1
+      else
+         for (( i=0; i<VOFFSET; i++ )); do
+            tput cuu1; tput el
+         done
+         echo "Commands to be added to $ROLE_NAME: "
+         fcc=1
+         for RCMD in "${CMD[@]}"; do
+            echo "$fcc: ${set_bold}${RCMD}${set_norm}"
+            let fcc=$fcc+1
+         done
+         GCD=TRUE
+      fi
+   done
+   
+   # Get the user netgroup(s) that will be allowed to use this command
+   echo ""
+   echo "------[SUDO User]------"
+   echo ""
+   LEFTINDENT=3
+   GUD=FALSE
+   while [[ $GUD == FALSE ]]; do
+      unset UN
+      # Display a list of "users" netgroups
+   
+      echo "Select the user netgroup(s) to be allowed to use this role"
+      echo ""
+      echo "Available to add:"
+      echo ""
+      
+      # List all "available" user netgroups - filter out groups that have already been selected.
+      dnc=1
+#      if [[ -n $UNA ]]; then
+#         AUNLIST=`$LDAP_SEARCH -b $NG_BASE "(&(objectClass=nisnetgroup)(cn=*_users))" cn | grep "^cn" | sed "s/cn:[ \t]//g" | egrep -v "$UNA"`
+#      else
+#         AUNLIST=`$LDAP_SEARCH -b $NG_BASE "(&(objectClass=nisnetgroup)(cn=*_users))" cn | grep "^cn" | sed "s/cn:[ \t]//g"`
+#      fi
+ AUNLIST=SUPERSECRET     
+      LONGEST=0
+      for s in $AUNLIST; do
+         if [[ `echo $s | wc -m` -gt $LONGEST ]]; then
+            LONGEST=`echo $s | wc -m`
+         fi
+      done
+      let COLWIDTH=$LONGEST+3
+      let COLHEIGHT=`echo $AUNLIST | wc -w`/4+1
+
+      # Start the row counter at 0
+      row=0
+
+      # Start the column counter at the left indent
+      col=$LEFTINDENT
+
+      for AUN in $AUNLIST; do
+
+         # Move the cursor to the right according to the col variable
+         for (( i=1; i<=$col; i++ )); do
+            tput cuf1
+         done
+         
+         # Write out the name
+         echo -en "$AUN\t"
+
+         # Increment the row counter
+         let row=row+1
+
+         #Position the cursor for the next write
+         if [[ $row -lt $COLHEIGHT ]]; then
+            # If the row is less than COLHEIGHT
+            # Set the cursor to the beginning of the line
+            tput cr
+            # And drop it down one row
+            tput cud1
+         elif [[ $row -eq $COLHEIGHT ]]; then
+            #If the number of lines written is equal to the COLHEIGHT we need
+            # to start another column
+
+            #move back up to the first row
+            for (( i=1; i<$COLHEIGHT; i++ )); do
+               tput cuu1
+            done
+
+            #add COLWIDTH to the column width so the cursor will start the correct
+            #number of spaces to the right
+            let col=$col+$COLWIDTH
+
+            # Set the cursor to the beginning of the line
+            tput cr
+
+            #reset the row counter so we know when we reach the next row
+            row=0
+         fi
+
+      done
+
+      # When we're done printing all of the elements, move the cursor beneath
+      # the list
+
+      let STB=$COLHEIGHT-$row
+
+      for (( i=1; i<$STB; i++ )); do
+         tput cud1
+      done
+       
+      echo ""
+      echo ""
+      echo -e "Currently Added: \n\n      `echo $UNA | sed 's/|/ /g'`"
+      echo ""
+            
+   
+      # Get a netgroup selection from the user
+      let VOFFSET=$COLHEIGHT+11
+      echo ""
+      read -p "Add Netgroup [leave blank to finish]: " UN
+      if [[ -n $UN ]]; then
+         # If the response was not fomatted with a _users suffix
+         if [[ -z `echo $UN | grep "_users$"` ]]; then
+            echo "Error: \"$UN\" is not a valid user netgroup name."
+            read -p "Press enter to try again, Ctrl+C to quit. " JUNK
+            # Restore cursor position
+            for (( i=0; i<VOFFSET; i++ )); do
+               tput cuu1; tput el
+            done
+         # If the netgroup doesn't exist in the directory
+         elif [[ -z `$LDAP_SEARCH -b $NG_BASE "(cn=$UN)" cn | grep "^cn:"` ]]; then
+            echo "Error: \"$UN\" was not found in the directory."
+            read -p "Press enter to try again, Ctrl+C to quit. " JUNK
+            # Restore cursor position
+            for (( i=0; i<VOFFSET; i++ )); do
+               tput cuu1; tput el
+            done
+         # If this is a duplicate of a netgroup already added
+         elif [[ -n $UNA ]] && [[ -n `echo $UNA | grep $UN` ]]; then
+            echo "Error: \"$UN\" has already been added to $ROLE_NAME"
+            read -p "Press enter to try again, Ctrl+C to quit. " JUNK
+            # Restore cursor position
+            for (( i=0; i<VOFFSET; i++ )); do
+               tput cuu1; tput el
+            done
+         # If none of the failures were positive
+         else
+            if [[ -z $UNA ]]; then
+               UNA=$UN
+            else
+               UNA="$UNA|$UN"
+            fi
+            # Restore cursor position
+            for (( i=0; i<VOFFSET; i++ )); do
+               tput cuu1; tput el
+            done
+         fi
+      else
+         GUD=TRUE
+         for (( i=0; i<VOFFSET; i++ )); do
+            tput cuu1; tput el
+         done
+         tput cuu1; tput el; tput cuu1; tput el
+         echo "Users added to $ROLE_NAME: ${set_bold}`echo $UNA | sed 's/|/ /g'`${set_norm}"
+      fi
+      
+   done
+   
+     # Get the host/machine netgroup(s) where this role may be used
+   echo ""
+   echo "------[SUDO Host]------"
+   echo ""
+
+   LEFTINDENT=3
+   GHD=FALSE
+   while [[ $GHD == FALSE ]]; do
+      unset HN
+      # Display a list of "host/machine" netgroups
+      echo "Select the host netgroups to be allowed to use this role"
+      echo "  (You'll need to use sudo_edit_role.sh to add \"_machine\" netgroups)"
+      echo ""
+      echo "Available to add:"
+      echo ""
+      
+      # List all "available" host netgroups - filter out groups that have already been selected.
+      dnc=1
+#      if [[ -n $HNA ]]; then
+#         #AHNLIST=`$LDAP_SEARCH -b $NG_BASE "(&(objectClass=nisnetgroup)(|(cn=*_hosts)(cn=*_machine)))" cn | grep "^cn" | sed "s/cn:[ \t]//g" | egrep -v "$HNA"`
+#         AHNLIST=`$LDAP_SEARCH -b $NG_BASE "(&(objectClass=nisnetgroup)(cn=*_hosts))" cn | grep "^cn" | sed "s/cn:[ \t]//g" | egrep -v "$HNA"`
+#      else
+#         #AHNLIST=`$LDAP_SEARCH -b $NG_BASE "(&(objectClass=nisnetgroup)(|(cn=*_hosts)(cn=*_machine)))" cn | grep "^cn" | sed "s/cn:[ \t]//g"`
+#         AHNLIST=`$LDAP_SEARCH -b $NG_BASE "(&(objectClass=nisnetgroup)(cn=*_hosts))" cn | grep "^cn" | sed "s/cn:[ \t]//g"`
+#      fi
+ AHNLIST=SUPERSECRET     
+      LONGEST=0
+      for s in $AHNLIST; do
+         if [[ `echo $s | wc -m` -gt $LONGEST ]]; then
+            LONGEST=`echo $s | wc -m`
+         fi
+      done
+      let COLWIDTH=$LONGEST+3
+      let COLHEIGHT=`echo $AHNLIST | wc -w`/4+1
+
+      # Start the row counter at 0
+      row=0
+
+      # Start the column counter at the left indent
+      col=$LEFTINDENT
+
+      for AHN in $AHNLIST; do
+
+         # Move the cursor to the right according to the col variable
+         for (( i=1; i<=$col; i++ )); do
+            tput cuf1
+         done
+         
+         # Write out the name
+         echo -en "$AHN\t"
+
+         # Increment the row counter
+         let row=row+1
+
+         #Position the cursor for the next write
+         if [[ $row -lt $COLHEIGHT ]]; then
+            # If the row is less than COLHEIGHT
+            # Set the cursor to the beginning of the line
+            tput cr
+            # And drop it down one row
+            tput cud1
+         elif [[ $row -eq $COLHEIGHT ]]; then
+            #If the number of lines written is equal to the COLHEIGHT we need
+            # to start another column
+
+            #move back up to the first row
+            for (( i=1; i<$COLHEIGHT; i++ )); do
+               tput cuu1
+            done
+
+            #add COLWIDTH to the column width so the cursor will start the correct
+            #number of spaces to the right
+            let col=$col+$COLWIDTH
+
+            # Set the cursor to the beginning of the line
+            tput cr
+
+            #reset the row counter so we know when we reach the next row
+            row=0
+         fi
+
+      done
+
+      # When we're done printing all of the elements, move the cursor beneath
+      # the list
+
+      let STB=$COLHEIGHT-$row
+
+      for (( i=1; i<$STB; i++ )); do
+         tput cud1
+      done
+
+      echo ""
+      echo ""
+      echo -e "Currently Added: \n\n      `echo $HNA | sed 's/|/ /g'`"
+      echo ""
+
+
+      # Get a netgroup selection from the user
+      let VOFFSET=$COLHEIGHT+12
+      echo ""
+      read -p "Add Netgroup [leave blank to finish]: " HN
+      if [[ -n $HN ]]; then
+         # If the response was not fomatted with a _users suffix
+         if [[ -z `echo $HN | egrep "_hosts$|_machine$"` ]]; then
+            echo "Error: \"$HN\" is not a valid host or machine netgroup name."
+            read -p "Press enter to try again, Ctrl+C to quit. " JUNK
+            # Restore cursor position
+            for (( i=0; i<VOFFSET; i++ )); do
+               tput cuu1; tput el
+            done
+         # If the netgroup doesn't exist in the directory
+         elif [[ -z `$LDAP_SEARCH -b $NG_BASE "(cn=$HN)" cn | grep "^cn:"` ]]; then
+            echo "Error: \"$HN\" was not found in the directory."
+            read -p "Press enter to try again, Ctrl+C to quit. " JUNK
+            # Restore cursor position
+            for (( i=0; i<VOFFSET; i++ )); do
+               tput cuu1; tput el
+            done
+         # If this is a duplicate of a netgroup already added
+         elif [[ -n $HNA ]] && [[ -n `echo $HNA | grep $HN` ]]; then
+            echo "Error: \"$HN\" has already been added to $ROLE_NAME"
+            read -p "Press enter to try again, Ctrl+C to quit. " JUNK
+            # Restore cursor position
+            for (( i=0; i<VOFFSET; i++ )); do
+               tput cuu1; tput el
+            done
+         # If none of the failures were positive
+         else
+            if [[ -z $HNA ]]; then
+               HNA=$HN
+            else
+               HNA="$HNA|$HN"
+            fi
+            # Restore cursor position
+            for (( i=0; i<VOFFSET; i++ )); do
+               tput cuu1; tput el
+            done
+         fi
+      else
+         for (( i=0; i<VOFFSET; i++ )); do
+            tput cuu1; tput el
+         done
+         tput cuu1; tput el; tput cuu1; tput el
+         echo "Hosts/Machines added to $ROLE_NAME: ${set_bold}`echo $HNA | sed 's/|/ /g'`${set_norm}"
+         GHD=TRUE
+      fi
+
+   done
+
+   # Ask if the user should be prompted for a password
+   echo ""
+   echo "------[Password Prompting]------"
+   echo ""
+   PPD=FALSE
+   while [[ $PPD == FALSE ]]; do
+      read -p "Require users to enter a password for this role? (y/n): " PPQ
+      if [[ -n `echo $PPQ | egrep '^y|^Y'` ]]; then
+         PPQ=Y
+         PPD=TRUE
+         tput cuu1; tput el; tput cuu1; tput el; tput cuu1; tput el
+         echo "Prompt for Password: ${set_bold}${PPQ}${set_norm}"
+      elif [[ -n `echo $PPQ | egrep '^n|^N'` ]]; then
+         PPQ=N
+         PPD=TRUE
+         tput cuu1; tput el; tput cuu1; tput el; tput cuu1; tput el
+         echo "Prompt for Password: ${set_bold}${PPQ}${set_norm}"
+      else
+         echo "Error: \"$PPQ\" is not a valid choice."
+         read -p "Press Enter to try again, Ctrl+C to quit. "
+         tput cuu1; tput el; tput cuu1; tput el; tput cuu1; tput el
+         unset PPQ
+      fi
+   done
+
+   # Ask for a description of the role
+   echo ""
+   echo "------[Role Description]------"
+   echo ""
+   echo "Provide a brief description of this role."
+   read -p "Role Description: " GDESC
+   SDESC=`echo $GDESC | tr -d '\`!@$%^&*()+=/|[]{}:;"\\'\'''`
+   tput cuu1; tput el; tput cuu1; tput el; tput cuu1; tput el; tput cuu1; tput el
+   echo "Description: ${set_bold}${SDESC}${set_norm}"
+   echo ""
+
+      
+   
+   
+   # Begin LDIF creation
+   echo "dn: cn=$ROLE_NAME,$SUDO_BASE" > $LDIF_TMP
+   echo "objectClass: top" >> $LDIF_TMP
+   echo "objectClass: sudorole" >> $LDIF_TMP
+   echo "cn: $ROLE_NAME" >> $LDIF_TMP
+   
+   # Add user netgroups
+   for UN in `echo $UNA | sed 's/|/ /g'`; do
+      echo "sudoUser: +$UN" >> $LDIF_TMP
+   done
+   
+   # Add host netgroups
+   for HN in `echo $HNA | sed 's/|/ /g'`; do
+      echo "sudoHost: +$HN" >> $LDIF_TMP
+   done
+   
+   # Add commands
+   for RCMD in "${CMD[@]}"; do
+      echo "sudoCommand: $RCMD" >> $LDIF_TMP
+   done
+   
+   # Add option(s)
+   if [[ $PPQ == N ]]; then
+      echo "sudoOption: !authenticate" >> $LDIF_TMP
+   else
+      echo "sudoOption: authenticate" >> $LDIF_TMP
+   fi
+
+   # Add description
+   if [[ -n $SDESC ]]; then
+      echo "Description: $SDESC" >> $LDIF_TMP
+   fi
+
+fi
+
+# Write object creation details to the backup logs
+if [[ ! -d $BACKUP_DIR ]]; then
+   mkdir -p $BACKUP_DIR
+fi
+LDIF_BAK=${BACKUP_DIR}/sudo_role_created_${ROLE_NAME}_${TS}.ldif
+
+echo "## Script Name: $0" > $LDIF_BAK
+echo "## Executed By/From: `/usr/bin/who -m`" >> $LDIF_BAK
+echo "##" >> $LDIF_BAK
+
+cat $LDIF_TMP >> $LDIF_BAK
+if [[ ! -s $LDIF_BAK ]]; then
+   echo "Error: there was a problem writing the create log for $ROLE_NAME"
+   exit
+#else
+#   echo "Create log written: $LDIF_BAK"
+fi
+
+   
+# Verify LDAP password
+VP=FALSE
+TRIES=0
+while [[ $VP == FALSE ]] && [[ $TRIES -le $MAXTRIES ]]; do
+   read -sp "LDAP Password ($UPDATE_USER): " UUP
+   echo "$LDAP_BT \"$UUP\"" | /bin/bash 2>&1 >/dev/null
+   if [[ $? != 0 ]]; then
+      unset UUP
+      let TRIES=$TRIES+1
+   else
+      echo ""
+      VP=TRUE
+   fi
+done
+
+
+echo "$LDAP_MODIFY -w \"$UUP\" -a -f $LDIF_TMP " | /bin/bash
+if [[ $? != 0 ]]; then
+   echo "There was an error adding the object(s)"
+   echo "The command that failed was:"
+   echo "   $LDAP_MODIFY -W -a -f $LDIF_TMP"
+   echo ""
+   echo "## Update failed" >> $LDIF_BAK
+   exit
+fi
+echo "## Update succeeded" >> $LDIF_BAK
+/bin/rm $LDIF_TMP
+
+exit
+echo "New Role $ROLE_NAME :"
+$LDAP_SEARCH -b $SUDO_BASE "(cn=$ROLE_NAME)" | awk /"# requesting"/,/"# search result"/ | egrep -v "^#$|^$|requesting:|search result"
+
+

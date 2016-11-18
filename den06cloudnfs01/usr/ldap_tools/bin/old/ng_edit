@@ -1,0 +1,945 @@
+#!/bin/bash
+
+###########################################
+# Purpose: Edit A Netgroup
+# Author: SDW
+# Incept 09/05/2012
+
+# Notes: - basic LDAP authentication must already be configured and working
+#          on the server where this script is run from
+
+f_Usage () {
+   echo "$0 USAGE"
+   echo ""
+   echo "$0 <netgroup name>"
+   echo ""
+   echo "   Opens a netgroup up for editing. If a netgroup name is not"
+   echo "   speified on the command line, you will be prompted to provide"
+   echo "   one."
+   echo ""
+   echo "   Note: netgroups cannot be re-named. You will need to create"
+   echo "   a new netgroup and delete the old one."
+   echo ""
+}
+
+
+# Set path to the location of the script no matter how it was invoked
+if [[ `echo $0 | sed 's/^.\///g'` == `basename $0` ]]; then
+   WORKDIR=`pwd`
+else
+   BASENAME=`basename $0`
+   WORKDIR=`echo $0 | sed 's/'"$BASENAME"'$//g'`
+fi
+
+cd $WORKDIR
+
+# Set some basic options for ldap searching, durrently the directory server doesn't require a binddn or a rootbinddn
+# so simple authentication should work fine
+LDAP_SEARCH="/usr/bin/ldapsearch -x -ZZ"
+UPDATE_USER=`ldapsearch -x -ZZ "(uid=$USER)" dn | grep ^dn: | sed 's/^dn:[ \t]//'`
+LDAP_MODIFY="/usr/bin/ldapmodify -x -ZZ -D \"$UPDATE_USER\""
+LDAP_BT="$LDAP_SEARCH '(ou=SUDOers)' -D \"$UPDATE_USER\" -w"
+MAXTRIES=5
+
+
+# Temp file to hold any ldif that we might need to push to the directory
+LDIF_TMP=/eit/admin/scripts/ldap_tools/tmp/.`basename $0`.$$.ldt
+LDIF_IN_TMP=/tmp/$$.lde.$$.ldt
+EDITFILE=/tmp/$$.neef
+NDSE=./ndse.dat
+BACKUP_DIR=/eit/admin/scripts/ldap_tools/local_backup
+TS=`date +%Y%m%d%H%M%S`
+
+
+# find the ldap base
+if [[ -s /etc/ldap.conf ]]; then
+   LDC=/etc/ldap.conf
+elif [[ -s /etc/openldap/ldap.conf ]]; then
+   LDC=/etc/openldap/ldap.conf
+fi
+LDAP_BASE=`egrep -i "^base[ \t]" $LDC | sed 's/^base[ \t]//i'`
+
+if [[ -z $LDAP_BASE ]]; then 
+   echo "Unable to find the base dn for LDAP - please make sure ldap is properly"
+   echo "configured on this machine.  If it IS properly configured and you're"
+   echo "still getting this error, you probably need to update the LDAP_SEARCH"
+   echo "variable in this script to something that works with the current config."
+   exit
+fi
+
+# Find base DNs
+NG_BASE=`$LDAP_SEARCH '(ou=Netgroups)' | grep "dn: ou" | awk '{print $2}'`
+
+# If there is no Netgroups OU then we need to create the OU
+if [[ -z $NG_BASE ]]; then
+  echo "No Netgroup OU was found at $LDAP_BASE..."
+  echo "Please run the appropriate script from directory-setup"
+  echo "and try again."
+  exit
+fi
+
+if [[ -z $UPDATE_USER ]]; then
+   echo "Unable to locate the correct DN for your user account [$USER]."
+   echo "You must be a member of the domain in order to use this script."
+   exit
+fi
+
+
+# Get information from the user
+
+NGTBE=$1
+
+# If we got a name from the command line
+if [[ -n $NGTBE ]]; then
+
+   if [[ "$NGTBE" == "--help" ]]; then
+      f_Usage
+      exit
+   fi
+
+   # Verify the netgroup exists
+   if [[ -z `$LDAP_SEARCH -b $NG_BASE "(cn=${NGTBE})" 2>&1 | egrep -v '^#|^$|^search|^result'` ]]; then
+      echo "ERROR: netgroup \"$NGTBE\" not found in the directory."
+      exit
+   else
+      NGTBEDN=`$LDAP_SEARCH -b $NG_BASE "(cn=${NGTBE})" dn | sed ':a;N;$!ba;s/\n //g'| grep ^dn: | grep $NGTBE | sed 's/^dn: //g'`
+   fi
+
+# If we did NOT get a name from the command line 
+else 
+
+   # Prompt the user for a name
+   VC2=FALSE
+   while [[ $VC2 == FALSE ]]; do
+      unset GNGTBE
+      read -p "What is the name of the netgroup to be edited?: " GNGTBE
+
+      # Check for non-existence - retry on error
+      if [[ -z `$LDAP_SEARCH -b $NG_BASE "(cn=${GNGTBE})" 2>&1 | egrep -v '^#|^$|^search|^result'` ]]; then
+         echo "ERROR: netgroup \"$GNGTBE\" not found in the directory."
+         read -p "Press Enter to try a different name, Ctrl+C to cancel." JUNK
+         tput uu1; tput el; tput uu1; tput el; tput uu1; tput el
+      else
+         VC2=TRUE
+         NGTBE=$GNGTBE
+         NGTBEDN=`$LDAP_SEARCH -b $NG_BASE "(cn=${NGTBE})" dn | sed ':a;N;$!ba;s/\n //g' | grep ^dn: | grep $NGTBE | sed 's/^dn: //g'`
+      fi
+   done
+fi
+
+NGTYPE=`echo $NGTBE | awk -F'_' '{print $NF}'`
+
+if [[ -z `echo $NGTYPE | egrep 'users|machine|hosts|sa'` ]]; then
+   echo "ERROR: unable to edit $NGTBE - it does not conform to standard naming."
+   exit
+fi
+
+LSTATE=`$LDAP_SEARCH -b $NG_BASE "(cn=${NGTBE})" filterInfo | grep ^filterInfo: | sed 's/^filterInfo:[ \t]//g'`
+if [[ -n $LSTATE ]] && [[ $LSTATE == 1 ]]; then 
+   echo "The netgroup [$NGTBE] is administratively locked and may not be edited."
+   echo "If you wish to view membership information, try the following:"
+   echo ""
+   echo "  To see users:"
+   echo "   lsnetgroup -n $NGTBE"
+   echo ""
+   echo "  To see netgroups:"
+   echo "   lsnetgroup -m $NGTBE"
+   echo ""
+   exit
+fi
+
+# Output the sudorole to a temp file
+
+#$LDAP_SEARCH -b $NG_BASE "(cn=${NGTBE})" | egrep -v '^#|^$|^search|^result' | sed ':a;N;$!ba;s/\n //g'> $LDIF_IN_TMP
+$LDAP_SEARCH -b "$NGTBEDN" | egrep -v '^#|^$|^search|^result' | sed ':a;N;$!ba;s/\n //g'> $LDIF_IN_TMP
+
+# Start the edit file
+
+echo "#### NG NAME ##############" > $EDITFILE
+echo "# DO NOT CHANGE NG NAME" >> $EDITFILE
+echo "###########################" >> $EDITFILE
+echo "NG_NAME: $NGTBE" >> $EDITFILE
+echo "" >> $EDITFILE
+
+# Add the user list
+
+if [[ "$NGTYPE" == "users" ]]; then
+   # Allowed members are LDAP users AND other user netgroups
+
+   echo "##USERS##############################################" >> $EDITFILE
+   echo "# You may specify as many USER lines as you like" >> $EDITFILE
+   echo "# USER must refer to an individual user" >> $EDITFILE
+   echo "# USER must NOT be a Service Account - Service Accounts" >> $EDITFILE
+   echo "#  may only be added to _sa type netgroups" >> $EDITFILE
+   echo "# Use a separate line for each user" >> $EDITFILE
+   echo "#####################################################" >> $EDITFILE
+   if [[ -n `grep '^nisNetgroupTriple:' $LDIF_IN_TMP` ]]; then
+      grep '^nisNetgroupTriple:' $LDIF_IN_TMP | grep "^nisNetgroupTriple:" | sed 's/^nisNetgroupTriple:/USER:/g; s/(,//g; s/(-,//g; s/,)//g' >> $EDITFILE
+   else
+      echo "#USER:" >> $EDITFILE
+   fi
+   echo "" >> $EDITFILE
+
+   echo "##USER NETGROUPS#####################################" >> $EDITFILE
+   echo "# You may make other user netgroups members of this one" >> $EDITFILE
+   echo "# You may add as many USERNG lines as you like" >> $EDITFILE
+   echo "# USERNG must refer to a user netgroup" >> $EDITFILE
+   echo "# Use a separate line for each user netgroup" >> $EDITFILE
+   echo "#####################################################" >> $EDITFILE
+   if [[ -z `grep '^memberNisNetgroup:' $LDIF_IN_TMP | grep "_users$"` ]]; then
+      echo "#USERNG: " >> $EDITFILE
+   else
+      grep '^memberNisNetgroup:' $LDIF_IN_TMP | grep "_users$" | grep "^memberNisNetgroup:" | sed 's/^memberNisNetgroup:/USERNG:/g' >> $EDITFILE
+   fi
+   echo "" >> $EDITFILE
+
+   # Add the description
+   echo "##NETGROUP DESCRIPTION###############################" >> $EDITFILE
+   echo "# The description should be brief, one line and provide" >> $EDITFILE
+   echo "# enough information to identify this group of users and" >> $EDITFILE
+   echo "# what role this netgroup is intended for." >> $EDITFILE
+   echo "#####################################################" >> $EDITFILE
+   DSTRING=`grep -i "^description:" $LDIF_IN_TMP`
+   if [[ -n `echo $DSTRING | grep -i "^description::"` ]]; then
+       BASE64DESC=`echo $DSTRING | grep -i "^description::" | sed 's/^description:://i'`
+       DESC=`echo $BASE64DESC | perl -MMIME::Base64 -0777 -ne 'print decode_base64($_)'`
+       echo "DESCRIPTION: $DESC" >> $EDITFILE
+   elif [[ -n `echo $DSTRING | grep -i "^description:"` ]]; then
+       DESC=`echo $DSTRING | grep -i "^description:" | sed 's/^description://i'`
+       echo "DESCRIPTION: $DESC" >> $EDITFILE
+   else
+       echo "#DESCRIPTION: " >> $EDITFILE
+   fi
+
+elif [[ "$NGTYPE" == "sa" ]]; then
+   # Allowed members are LDAP users AND other user netgroups
+
+   echo "##SERVICE ACCOUNTS###################################" >> $EDITFILE
+   echo "# You may specify as many SA lines as you like" >> $EDITFILE
+   echo "# SA must refer to an individual Service Account" >> $EDITFILE
+   echo "# SA must NOT be a personal user account - user accounts" >> $EDITFILE
+   echo "#  may only be added to _user type netgroups" >> $EDITFILE
+   echo "# Use a separate line for each user" >> $EDITFILE
+   echo "#####################################################" >> $EDITFILE
+   if [[ -n `grep '^nisNetgroupTriple:' $LDIF_IN_TMP` ]]; then
+      grep '^nisNetgroupTriple:' $LDIF_IN_TMP | grep "^nisNetgroupTriple:" | sed 's/^nisNetgroupTriple:/SA:/g; s/(,//g; s/(-,//g; s/,)//g' >> $EDITFILE
+   else
+      echo "#SA:" >> $EDITFILE
+   fi
+   echo "" >> $EDITFILE
+
+   echo "##SERVICE ACCOUNT NETGROUPS##########################" >> $EDITFILE
+   echo "# You may make other Service Account netgroups members " >> $EDITFILE
+   echo "#  of this one" >> $EDITFILE
+   echo "# You may add as many SANG lines as you like" >> $EDITFILE
+   echo "# SANG must refer to a Service Account netgroup" >> $EDITFILE
+   echo "# Use a separate line for each SA netgroup" >> $EDITFILE
+   echo "#####################################################" >> $EDITFILE
+   if [[ -z `grep '^memberNisNetgroup:' $LDIF_IN_TMP | egrep "_users$|_sa$"` ]]; then
+      echo "#SANG: " >> $EDITFILE
+   else
+      grep '^memberNisNetgroup:' $LDIF_IN_TMP | egrep "_users$|_sa$" | grep "^memberNisNetgroup:" | sed 's/^memberNisNetgroup:/SANG:/g' >> $EDITFILE
+   fi
+   echo "" >> $EDITFILE
+
+   # Add the description
+   echo "##NETGROUP DESCRIPTION###############################" >> $EDITFILE
+   echo "# The description should be brief, one line and provide" >> $EDITFILE
+   echo "# enough information to identify this group of service" >> $EDITFILE
+   echo "# accounts and what role this netgroup is intended for." >> $EDITFILE
+   echo "#####################################################" >> $EDITFILE
+   DSTRING=`grep -i "^description:" $LDIF_IN_TMP`
+   if [[ -n `echo $DSTRING | grep -i "^description::"` ]]; then
+       BASE64DESC=`echo $DSTRING | grep -i "^description::" | sed 's/^description:://i'`
+       DESC=`echo $BASE64DESC | perl -MMIME::Base64 -0777 -ne 'print decode_base64($_)'`
+       echo "DESCRIPTION: $DESC" >> $EDITFILE
+   elif [[ -n `echo $DSTRING | grep -i "^description:"` ]]; then
+       DESC=`echo $DSTRING | grep -i "^description:" | sed 's/^description://i'`
+       echo "DESCRIPTION: $DESC" >> $EDITFILE
+   else
+       echo "#DESCRIPTION: " >> $EDITFILE
+   fi
+
+
+elif [[ "$NGTYPE" == "hosts" ]]; then
+   # Allowed members are machine netgroups, and other hosts netgroups
+
+   echo "##HOSTS#############################################" >> $EDITFILE
+   echo "# HOST should be the simple (unqualified) hostname" >> $EDITFILE
+   echo "# HOST must be a machine that is registered in LDAP" >> $EDITFILE
+   echo "# You may specify as many HOST entries as you like" >> $EDITFILE
+   echo "# Use a separate line for each HOST" >> $EDITFILE
+   echo "#####################################################" >> $EDITFILE
+   if [[ -n `grep '^nisNetgroupTriple:' $LDIF_IN_TMP` ]]; then
+      grep '^nisNetgroupTriple:' $LDIF_IN_TMP | grep "^nisNetgroupTriple:" | sed 's/^nisNetgroupTriple:/HOST:/g; s/(//g; s/,,)//g; s/,-,)//g;' >> $EDITFILE
+   else
+      echo "#HOST:" >> $EDITFILE
+   fi
+   echo "" >> $EDITFILE
+
+   echo "##HOST NETGROUPS#####################################" >> $EDITFILE
+   echo "# You may specify other Host Netgroups as members of" >> $EDITFILE
+   echo "# this one. " >> $EDITFILE
+   echo "# You may specify as many HOSTNG entries as you like" >> $EDITFILE
+   echo "# Use a separate line for each HOSTNG" >> $EDITFILE
+   echo "#####################################################" >> $EDITFILE
+   if [[ -z `grep '^memberNisNetgroup:' $LDIF_IN_TMP | grep "_hosts$"` ]]; then
+      echo "# HOSTNG: " >> $EDITFILE
+   else
+      grep '^memberNisNetgroup:' $LDIF_IN_TMP | grep "_host$" | grep "^memberNisNetgroup:" | sed 's/^memberNisNetgroup:/HOSTNG:/g' >> $EDITFILE
+   fi
+   echo "" >> $EDITFILE
+
+
+   echo "##HOST NETGROUPS#####################################" >> $EDITFILE
+   echo "# You may make other host netgroups members of this one" >> $EDITFILE
+   echo "# You may add as many HOSTNG lines as you like" >> $EDITFILE
+   echo "# HOSTNG must refer to a host netgroup" >> $EDITFILE
+   echo "# Use a separate line for each host netgroup" >> $EDITFILE
+   echo "#####################################################" >> $EDITFILE
+   if [[ -z `grep '^memberNisNetgroup:' $LDIF_IN_TMP | grep "_hosts$"` ]]; then
+      echo "# HOSTNG: " >> $EDITFILE
+   else
+      grep '^memberNisNetgroup:' $LDIF_IN_TMP | grep "_hosts$" | grep "^memberNisNetgroup:" | sed 's/^memberNisNetgroup:/HOSTNG:/g' >> $EDITFILE
+   fi
+   echo "" >> $EDITFILE
+
+   # Add the description
+   echo "##NETGROUP DESCRIPTION###############################" >> $EDITFILE
+   echo "# The description should be brief, one line and provide" >> $EDITFILE
+   echo "# enough information to identify this group of hosts and" >> $EDITFILE
+   echo "# what they have in common." >> $EDITFILE
+   echo "#####################################################" >> $EDITFILE
+   DSTRING=`grep -i "^description:" $LDIF_IN_TMP`
+   if [[ -n `echo $DSTRING | grep -i "^description::"` ]]; then
+       BASE64DESC=`echo $DSTRING | grep -i "^description::" | sed 's/^description:://i'`
+       DESC=`echo $BASE64DESC | perl -MMIME::Base64 -0777 -ne 'print decode_base64($_)'`
+       echo "DESCRIPTION: $DESC" >> $EDITFILE
+   elif [[ -n `echo $DSTRING | grep -i "^description:"` ]]; then
+       DESC=`echo $DSTRING | grep -i "^description:" | sed 's/^description://i'`
+       echo "DESCRIPTION: $DESC" >> $EDITFILE
+   else
+       echo "#DESCRIPTION: " >> $EDITFILE
+   fi
+
+elif [[ "$NGTYPE" == "machine" ]]; then
+   # Allowed members are user netgroups
+
+   echo "##USER NETGROUPS#####################################" >> $EDITFILE
+   echo "# Adding user netgroups to this machine netgroup" >> $EDITFILE
+   echo "# will allow its members to log in." >> $EDITFILE
+   echo "# USERNG must refer to a user netgroup" >> $EDITFILE
+   echo "# Use a separate line for each user netgroup" >> $EDITFILE
+   echo "# You may not remove any of the following user netgroups" >> $EDITFILE
+   echo "# from a machine netgroup:" >> $EDITFILE
+   echo "#    UnixAdmin_users" >> $EDITFILE
+   echo "#    StorageAdmin_users" >> $EDITFILE
+   echo "#####################################################" >> $EDITFILE
+   if [[ -z `grep '^memberNisNetgroup:' $LDIF_IN_TMP | grep "_users$"` ]]; then
+      echo "# USERNG: " >> $EDITFILE
+   else
+      grep '^memberNisNetgroup:' $LDIF_IN_TMP | grep "_users$" | grep "^memberNisNetgroup:" | sed 's/^memberNisNetgroup:/USERNG:/g' >> $EDITFILE
+   fi
+   echo "" >> $EDITFILE
+
+   echo "##SERVICE ACCOUNT NETGROUPS##########################" >> $EDITFILE
+   echo "# !!! WARNING !!!" >> $EDITFILE
+   echo "# DO NOT ADD Service Account Netgroups to this machine" >> $EDITFILE
+   echo "#  unless InfoSEC has granted approval to do so." >> $EDITFILE
+   echo "# You may add as many SANG lines as you like" >> $EDITFILE
+   echo "# SANG must refer to a Service Account netgroup" >> $EDITFILE
+   echo "# Use a separate line for each SA netgroup" >> $EDITFILE
+   echo "#####################################################" >> $EDITFILE
+   if [[ -z `grep '^memberNisNetgroup:' $LDIF_IN_TMP | egrep "_sa$"` ]]; then
+      echo "#SANG: " >> $EDITFILE
+   else
+      grep '^memberNisNetgroup:' $LDIF_IN_TMP | egrep "_sa$" | grep "^memberNisNetgroup:" | sed 's/^memberNisNetgroup:/SANG:/g' >> $EDITFILE
+   fi
+   echo "" >> $EDITFILE
+
+
+   DSTRING=`grep -i "^description:" $LDIF_IN_TMP`
+   if [[ -n `echo $DSTRING | grep -i "^description::"` ]]; then
+       BASE64DESC=`echo $DSTRING | grep -i "^description::" | sed 's/^description:://i'`
+       DESC=`echo $BASE64DESC | perl -MMIME::Base64 -0777 -ne 'print decode_base64($_)'`
+   elif [[ -n `echo $DSTRING | grep -i "^description:"` ]]; then
+       DESC=`echo $DSTRING | grep -i "^description:" | sed 's/^description://i'`
+   fi
+
+   SER=`echo $DESC | awk -F':::' '{print $2}' | awk -F'::' '{print $1}'`
+   HN=`echo $DESC | awk -F':::' '{print $2}' | awk -F'::' '{print $2}'`
+   PDT=`echo $DESC | awk -F':::' '{print $2}' | awk -F'::' '{print $3}'`
+   LUTIME=`echo $DESC | awk -F':::' '{print $2}' | awk -F'::' '{print $4}'`
+   IPADDR=`echo $DESC | awk -F':::' '{print $2}' | awk -F'::' '{print $5}'`
+   JUSER=`echo $DESC | awk -F':::' '{print $2}' | awk -F'::' '{print $6}'`
+    
+
+   echo "##SERIAL NUMBER######################################" >> $EDITFILE
+   echo "# Only one SERIAL: may be specified" >> $EDITFILE
+   echo "# Normally this is set by the configure_ldap.sh" >> $EDITFILE
+   echo "# script, and should not be changed unless you have" >> $EDITFILE
+   echo "# replaced a server and re-used an old name" >> $EDITFILE
+   echo "#####################################################" >> $EDITFILE
+   echo "SERIAL: $SER" >> $EDITFILE
+   echo "" >> $EDITFILE
+
+   echo "## PRODUCT NAME #####################################" >> $EDITFILE
+   echo "# Only one PRODUCT: may be specified" >> $EDITFILE
+   echo "# Normally this is set by the configure_ldap.sh" >> $EDITFILE
+   echo "# script, and should not be changed unless you have" >> $EDITFILE
+   echo "# replaced a server and re-used an old name" >> $EDITFILE
+   echo "#####################################################" >> $EDITFILE
+   echo "PRODUCT: $PDT" >> $EDITFILE
+   echo "" >> $EDITFILE
+
+   echo "## IP ADDRESS #######################################" >> $EDITFILE
+   echo "# Only one IPADDR: may be specified" >> $EDITFILE
+   echo "# Normally this is set by the configure_ldap.sh" >> $EDITFILE
+   echo "# script and should not be changed unless the server" >> $EDITFILE
+   echo "# has been moved, or this value is blank" >> $EDITFILE
+   echo "#####################################################" >> $EDITFILE
+   if [[ -z "$IPADDR" ]]; then
+      echo "#IPADDR: " >> $EDITFILE
+   else
+      echo "IPADDR: ${IPADDR}" >> $EDITFILE
+   fi
+
+   echo "#@@@@@@@@@@[ READ-ONLY ATTRIBUTES] @@@@@@@@@@@@@@@@@@" >> $EDITFILE
+   echo "# The following attributes are for informational    @" >> $EDITFILE
+   echo "# purposes and cannot be edited. They can only be   @" >> $EDITFILE
+   echo "# changed by deleting this machine netgroup and     @" >> $EDITFILE
+   echo "# re-creating it with configure_ldap.sh on the host @" >> $EDITFILE
+   echo "# or with ng_create.sh                              @" >> $EDITFILE
+   echo "#@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@" >> $EDITFILE
+   echo "Netgroup created on: $LUTIME" >> $EDITFILE
+   echo "Added by user: $JUSER" >> $EDITFILE
+
+fi
+
+
+# The editable update file has been built, now we need to record the md5sum
+# so we can tell if it was changed.
+
+BEFORE_MD5=`md5sum $EDITFILE | awk '{print $1}'`
+
+# keep editing the file until the user quits or verification passes
+VERIFIED=FALSE
+while [[ $VERIFIED == FALSE ]]; do
+
+
+   vim $EDITFILE
+
+   # Next, check the file for updates
+
+   AFTER_MD5=`md5sum $EDITFILE | awk '{print $1}'`
+
+   if [[ "$AFTER_MD5" == "$BEFORE_MD5" ]]; then
+      echo "No changes made - nothing to update."
+      /bin/rm $EDITFILE
+      /bin/rm $LDIF_IN_TMP
+      exit
+   fi
+
+   # If updates were found, then check them
+
+
+   echo ""
+   echo "Checking the edited file for errors..."
+   echo ""
+   
+
+   # Start with the assumption that everything checks out.  Any one
+   # Failure will change this value
+   FAILURE=NO
+
+   # Check name
+   echo "Checking Name"
+   NN=`grep "^NG_NAME:" $EDITFILE | sed 's/^NG_NAME: //; s/^NG_NAME://'`
+   if [[ $NN != $NGTBE ]]; then
+      echo "Error: NG_NAME does not match the role being edited!"
+      FAILURE=YES
+   fi
+  
+   if [[ "$NGTYPE" == "users" ]]; then
+   # Allowed members are LDAP users AND other user netgroups
+ 
+      # Check users list - users are optional
+      if [[ -n `grep "^USER:" $EDITFILE | sed 's/^USER: //g; s/^USER://g'` ]]; then
+         unset SUS
+         for SU in `grep "^USER:" $EDITFILE | sed 's/^USER: //g; s/^USER://g'`; do
+            # If the user doesn't already exist as a nisNetgroupTriple in the LDIF_IN_TMP, then the operator
+            # is trying to add him/her, in which case we need to check to see if the user is already in
+            # other netgroups and disallow if so.
+            if [[ -z `grep "(-,${SU},)" $LDIF_IN_TMP` ]]; then
+               # Check to see how many _users netgroups this user is currently in
+               UCFSU=`$LDAP_SEARCH -b ou=Users,ou=Netgroups,${LDAP_BASE} "(&(cn=*_users)(nisNetgroupTriple=\(-,$SU,\)))" cn | grep "^cn:" | wc -l`
+               E=FALSE
+               if [[ -f unce.dat ]]; then
+                  if [[ -n `grep "^${SU}$" unce.dat` ]]; then
+                     E=TRUE
+                  fi
+               fi
+               if [[ $UCFSU -gt 0 ]] && [[ "$E" == "FALSE" ]]; then
+                  echo "Error: unable to add [$SU]. Users may only be placed in 1 Netgroup, [$SU] is in $UCFSU other Netgroup(s)."
+                  FAILURE=YES
+               fi
+            fi
+            # If the user account doesn't exist under "People or FTSAccounts" then it can't be added to a _users netgroup
+            if [[ -z `$LDAP_SEARCH -b ou=People,${LDAP_BASE} "(&(objectClass=posixAccount)(uid=$SU))" uid | grep "^uid:"` ]] && [[ -z `$LDAP_SEARCH -b ou=FTSAccounts,${LDAP_BASE} "(&(objectClass=posixAccount)(uid=$SU))" uid | grep "^uid:"` ]]; then
+               if [[ -n `$LDAP_SEARCH -b ou=ServiceAccounts,${LDAP_BASE} "(&(objectClass=posixAccount)(uid=$SU))" uid | grep "^uid:"` ]]; then
+                  echo "Error: [$SU] is a Service Account.  Service Accounts are not permitted in user netgroups."
+               else
+                  echo "Error: user \"$SU\" does not exist in the directory."
+               fi
+               FAILURE=YES
+            else
+              if [[ -z $SUS ]]; then
+                 SUS=$SU
+              else
+                 SUS="$SUS,$SU"
+              fi
+            fi
+         done  
+      fi
+
+      # Check user netgroups list - user netgroups are optional
+      if [[ -n `grep "^USERNG:" $EDITFILE | sed 's/^USERNG: //g; s/^USERNG://g'` ]]; then
+         unset SUNS
+         for SUN in `grep "^USERNG:" $EDITFILE | sed 's/^USERNG: //g; s/^USERNG://g'`; do
+            if [[ -z `echo $SUN | grep "_users$"` ]]; then
+               echo "Error: \"$SUN\" is not a user netgroup"
+               FAILURE=YES
+            elif [[ -z `$LDAP_SEARCH -b ou=Users,$NG_BASE "(cn=$SUN)" cn | grep "^cn:"` ]]; then
+               echo "Error: user netgroup \"$SUN\" does not exist in the directory."
+               FAILURE=YES
+            else
+              if [[ -z $SUNS ]]; then
+                 SUNS=$SUN
+              else
+                 SUNS="$SUNS,$SUN"
+              fi
+            fi
+         done
+      fi
+
+   elif [[ "$NGTYPE" == "sa" ]]; then
+   # Allowed members are LDAP Service Accounts AND other Service Account netgroups
+
+      # Check users list - users are optional
+      if [[ -n `grep "^SA:" $EDITFILE | sed 's/^SA: //g; s/^SA://g'` ]]; then
+         unset SAUS
+         for SAU in `grep "^SA:" $EDITFILE | sed 's/^SA: //g; s/^SA://g'`; do
+            if [[ -z `$LDAP_SEARCH -b ou=ServiceAccounts,${LDAP_BASE} "(&(objectClass=posixAccount)(uid=$SAU))" uid | grep "^uid:"` ]] && [[ -z `grep "^${SAU}$" $NDSE` ]]; then
+               if [[ -n `$LDAP_SEARCH -b ou=People,${LDAP_BASE} "(&(objectClass=posixAccount)(uid=$SAU))" uid | grep "^uid:"` ]]; then
+                  echo "Error: [$SAU] is a personal account. Personal user accounts are not permitted in Service Account netgroups."
+               else
+                  echo "Error: Service Account \"$SAU\" does not exist in the directory."
+               fi
+               FAILURE=YES
+            else
+              if [[ -z $SAUS ]]; then
+                 SAUS=$SAU
+              else
+                 SAUS="$SAUS,$SAU"
+              fi
+            fi
+         done
+      fi
+
+      # Check service account netgroups list - SA netgroups are optional
+      if [[ -n `grep "^SANG:" $EDITFILE | sed 's/^SANG: //g; s/^SANG://g'` ]]; then
+         unset SSANS
+         for SSAN in `grep "^SANG:" $EDITFILE | sed 's/^SANG: //g; s/^SANG://g'`; do
+            if [[ -z `echo $SSAN | grep "_sa$"` ]]; then
+               echo "Error: \"$SSAN\" is not a ServiceAccount netgroup"
+               FAILURE=YES
+            elif [[ -z `$LDAP_SEARCH -b ou=SA,$NG_BASE "(cn=$SSAN)" cn | grep "^cn:"` ]]; then
+               echo "Error: Service Account netgroup \"$SSAN\" does not exist in the directory."
+               FAILURE=YES
+            else
+              if [[ -z $SSANS ]]; then
+                 SSANS=$SSAN
+              else
+                 SSANS="$SSANS,$SSAN"
+              fi
+            fi
+         done
+      fi
+
+
+   elif [[ "$NGTYPE" == "hosts" ]]; then
+   # Allowed members are host netgroups, and hosts
+
+      # Check host list - hosts are optional
+      if [[ -n `grep "^HOST:" $EDITFILE | sed 's/^HOST: //g; s/^HOST://g'` ]]; then
+         unset SHS
+         for SH in `grep "^HOST:" $EDITFILE | sed 's/^HOST: //g; s/^HOST://g'`; do
+            if [[ -z `$LDAP_SEARCH -b $NG_BASE "(nisNetgroupTriple=\($SH,-,\))" cn | grep "^cn:"` ]]; then
+               echo "Error: host \"$SH\" does not exist in the directory."
+               FAILURE=YES
+            else
+              if [[ -z $SHS ]]; then
+                 SHS=$SH
+              else
+                 SHS="$SHS,$SH"
+              fi
+            fi
+         done
+      fi
+
+
+      # Check host netgroups list - host netgroups are optional
+      if [[ -n `grep "^HOSTNG:" $EDITFILE | sed 's/^HOSTNG: //g; s/^HOSTNG://g'` ]]; then
+         unset SHNS
+         for SHN in `grep "^HOSTNG:" $EDITFILE | sed 's/^HOSTNG: //g; s/^HOSTNG://g'`; do
+            if [[ -z `echo $SHN | grep "_hosts$"` ]]; then
+               echo "Error: \"$SHN\" is not a host netgroup"
+               FAILURE=YES
+            elif [[ -z `$LDAP_SEARCH -b $NG_BASE "(cn=$SHN)" cn | grep "^cn:"` ]]; then
+               echo "Error: host netgroup \"$SHN\" does not exist in the directory."
+               FAILURE=YES
+            else
+              if [[ -z $SHNS ]]; then
+                 SHNS=$SHN
+              else
+                 SHNS="$SHNS,$SHN"
+              fi
+            fi
+         done
+      fi
+
+   elif [[ "$NGTYPE" == "machine" ]]; then
+   # Allowed members are user netgroups
+
+      # Check user netgroups list - user netgroups are NOT optional
+      if [[ -z `grep "^USERNG:" $EDITFILE | sed 's/^USERNG: //g; s/^USERNG://g'` ]]; then
+         echo "Error: Machine netgroups must have at least one user netgroup, or"
+         echo "       no one will be able to log in to the machine."
+      else
+         unset SUNS
+         for SUN in `grep "^USERNG:" $EDITFILE | sed 's/^USERNG: //g; s/^USERNG://g'`; do
+            if [[ -z `echo $SUN | grep "_users$"` ]]; then
+               echo "Error: \"$SUN\" is not a user netgroup"
+               FAILURE=YES
+            elif [[ -z `$LDAP_SEARCH -b $NG_BASE "(cn=$SUN)" cn | grep "^cn:"` ]]; then
+               echo "Error: user netgroup \"$SUN\" does not exist in the directory."
+               FAILURE=YES
+            else
+              if [[ -z $SUNS ]]; then
+                 SUNS=$SUN
+              else
+                 SUNS="$SUNS,$SUN"
+              fi
+            fi
+         done
+
+         # Check service account netgroups list - SA netgroups are optional
+         if [[ -n `grep "^SANG:" $EDITFILE | sed 's/^SANG: //g; s/^SANG://g'` ]]; then
+            unset SSANS
+            for SSAN in `grep "^SANG:" $EDITFILE | sed 's/^SANG: //g; s/^SANG://g'`; do
+               if [[ -z `echo $SSAN | grep "_sa$"` ]]; then
+                  echo "Error: \"$SSAN\" is not a ServiceAccount netgroup"
+                  FAILURE=YES
+               elif [[ -z `$LDAP_SEARCH -b ou=SA,$NG_BASE "(cn=$SSAN)" cn | grep "^cn:"` ]]; then
+                  echo "Error: Service Account netgroup \"$SSAN\" does not exist in the directory."
+                  FAILURE=YES
+               else
+                 if [[ -z $SSANS ]]; then
+                    SSANS=$SSAN
+                 else
+                    SSANS="$SSANS,$SSAN"
+                 fi
+               fi
+            done
+         fi
+
+
+         # Check for UnixAdmin_users, StorageAdmin_users, and AppAdmin_users
+         if [[ -z `echo $SUNS | grep "UnixAdmin_users"` ]]; then
+            echo "Error: You may not remove UnixAdmin_users from a machine netgroup"
+            FAILURE=YES
+         elif [[ -z `echo $SUNS | grep "StorageAdmin_users"` ]]; then
+            echo "Error: You may not remove StorageAdmin_users from a machine netgroup"
+            FAILURE=YES
+         #elif [[ -z `echo $SUNS | grep "AppAdmin_users"` ]]; then
+         #   echo "Error: You may not remove AppAdmin_users from a machine netgroup"
+         #   FAILURE=YES
+         fi
+      fi
+
+      # Check serial and product tags - can't check for syntax, but these are not optional
+
+       OSER=`grep "^SERIAL:" $EDITFILE | sed 's/^SERIAL://; s/^ //;'`
+       if [[ -z $OSER ]]; then
+          echo "Error: SERIAL is a required attribute for a machine netgroup."
+          FAILURE=YES
+       fi
+       
+       OPDT=`grep "^PRODUCT:" $EDITFILE | sed 's/^PRODUCT://; s/^ //;'`
+       if [[ -z $OPDT ]]; then
+          echo "Error: PRODUCT is a required attribute for a machine netgroup."
+          FAILURE=YES
+       fi
+
+
+   fi
+
+   # Check for duplicate lines - LDAP ADD will fail even on arbitrary fields
+   # If the same value is specified more than once for any attribute
+   if [[ -n `cat $EDITFILE | uniq -d` ]]; then
+      echo "Error: duplicate instances of the following line detected"
+      cat $EDITFILE | uniq -d | sed 's/^/      /g'
+      FAILURE=YES
+   fi
+
+
+   # Now, check to see if we failed at any point
+   if [[ $FAILURE == YES ]]; then
+      echo ""
+      echo "Unable to apply the changes because of the errors above."
+      read -p "Enter \"e\" to edit the file, anything else to quit: " ERRORCHOICE
+      if [[ "$ERRORCHOICE" != "e" ]] && [[ "$ERRORCHOICE" != "E" ]]; then
+         /bin/rm $EDITFILE
+         exit
+      fi
+   else
+      VERIFIED=TRUE
+   fi
+
+
+done
+
+echo "Verification passed.  Applying update."
+
+# Build our LDIF based on the new information, we'll be replacing the values
+# with whatever was read in from the edited file
+
+if [[ -f $LDIF_TMP ]]; then
+   /bin/rm $LDIF_TMP
+fi
+
+# Specify the DN of the SUDO role to be edited and specify that we're modifying it
+echo "dn: $NGTBEDN" > $LDIF_TMP
+echo "changetype: modify" >> $LDIF_TMP
+
+if [[ "$NGTYPE" == "users" ]]; then
+# Allowed members are LDAP users AND other user netgroups
+
+   #Update users
+   if [[ -n `grep ^nisNetgroupTriple $LDIF_IN_TMP` ]]; then
+      echo "delete: nisNetgroupTriple" >> $LDIF_TMP
+      echo "-" >> $LDIF_TMP
+   fi
+   if [[ -n $SUS ]]; then
+      echo "add: nisNetgroupTriple" >> $LDIF_TMP
+      for SU in `echo $SUS | sed 's/,/ /g'`;do
+         echo "nisNetgroupTriple: (-,$SU,)"  >> $LDIF_TMP
+      done
+      echo "-" >> $LDIF_TMP
+   fi
+
+   #Update user netgroups
+   if [[ -n `grep ^memberNisNetgroup $LDIF_IN_TMP` ]]; then
+      echo "delete: memberNisNetgroup" >> $LDIF_TMP
+      echo "-" >> $LDIF_TMP
+   fi
+   if [[ -n $SUNS ]]; then
+      echo "add: memberNisNetgroup" >> $LDIF_TMP
+      for NG in `echo $SUNS | sed 's/,/ /g'`;do
+         echo "memberNisNetgroup: $NG"  >> $LDIF_TMP
+      done
+      echo "-" >> $LDIF_TMP
+   fi
+
+   #Update description
+   if [[ -n `grep -i ^description $LDIF_IN_TMP` ]]; then
+      echo "delete: description" >> $LDIF_TMP
+      echo "-" >> $LDIF_TMP
+   fi
+   ODESC=`grep "^DESCRIPTION:" $EDITFILE | sed 's/^DESCRIPTION://; s/^ //;'`
+   if [[ -n $ODESC ]]; then
+      echo "add: Description" >> $LDIF_TMP
+      echo "Description: $ODESC" >> $LDIF_TMP
+      echo "-" >> $LDIF_TMP
+   fi
+
+elif [[ "$NGTYPE" == "sa" ]]; then
+# Allowed members are LDAP users AND other user netgroups
+
+   #Update service accounts
+   if [[ -n `grep ^nisNetgroupTriple $LDIF_IN_TMP` ]]; then
+      echo "delete: nisNetgroupTriple" >> $LDIF_TMP
+      echo "-" >> $LDIF_TMP
+   fi
+   if [[ -n $SAUS ]]; then
+      echo "add: nisNetgroupTriple" >> $LDIF_TMP
+      for SAU in `echo $SAUS | sed 's/,/ /g'`;do
+         echo "nisNetgroupTriple: (-,$SAU,)"  >> $LDIF_TMP
+      done
+      echo "-" >> $LDIF_TMP
+   fi
+
+   #Update service account netgroups
+   if [[ -n `grep ^memberNisNetgroup $LDIF_IN_TMP` ]]; then
+      echo "delete: memberNisNetgroup" >> $LDIF_TMP
+      echo "-" >> $LDIF_TMP
+   fi
+   if [[ -n $SSANS ]]; then
+      echo "add: memberNisNetgroup" >> $LDIF_TMP
+      for NG in `echo $SSANS | sed 's/,/ /g'`;do
+         echo "memberNisNetgroup: $NG"  >> $LDIF_TMP
+      done
+      echo "-" >> $LDIF_TMP
+   fi
+
+   #Update description
+   if [[ -n `grep -i ^description $LDIF_IN_TMP` ]]; then
+      echo "delete: description" >> $LDIF_TMP
+      echo "-" >> $LDIF_TMP
+   fi
+   ODESC=`grep "^DESCRIPTION:" $EDITFILE | sed 's/^DESCRIPTION://; s/^ //;'`
+   if [[ -n $ODESC ]]; then
+      echo "add: Description" >> $LDIF_TMP
+      echo "Description: $ODESC" >> $LDIF_TMP
+      echo "-" >> $LDIF_TMP
+   fi
+
+
+
+elif [[ "$NGTYPE" == "hosts" ]]; then
+# Allowed members are machine netgroups, and other hosts netgroups
+
+   #Update machine and host netgroups
+   if [[ -n `grep ^memberNisNetgroup $LDIF_IN_TMP` ]]; then
+      echo "delete: memberNisNetgroup" >> $LDIF_TMP
+      echo "-" >> $LDIF_TMP
+   fi
+   if [[ -n $SMNS ]] || [[ -n $SHNS ]]; then
+      echo "add: memberNisNetgroup" >> $LDIF_TMP
+      for NG in `echo $SHNS | sed 's/,/ /g'`;do
+         echo "memberNisNetgroup: $NG"  >> $LDIF_TMP
+      done
+      echo "-" >> $LDIF_TMP
+   fi
+
+   if [[ -n `grep ^nisNetgroupTriple $LDIF_IN_TMP` ]]; then
+      echo "delete: nisNetgroupTriple" >> $LDIF_TMP
+      echo "-" >> $LDIF_TMP
+   fi
+   if [[ -n $SHS ]]; then
+      echo "add: nisNetgroupTriple" >> $LDIF_TMP
+      for SH in `echo $SHS | sed 's/,/ /g'`;do
+         echo "nisNetgroupTriple: ($SH,-,)"  >> $LDIF_TMP
+      done
+      echo "-" >> $LDIF_TMP
+   fi
+
+
+   #Update description
+   if [[ -n `grep -i ^description $LDIF_IN_TMP` ]]; then
+      echo "delete: description" >> $LDIF_TMP
+      echo "-" >> $LDIF_TMP
+   fi
+   ODESC=`grep "^DESCRIPTION:" $EDITFILE | sed 's/^DESCRIPTION://; s/^ //;'`
+   if [[ -n $ODESC ]]; then
+      echo "add: Description" >> $LDIF_TMP
+      echo "Description: $ODESC" >> $LDIF_TMP
+      echo "-" >> $LDIF_TMP
+   fi
+
+elif [[ "$NGTYPE" == "machine" ]]; then
+# Allowed members are user netgroups
+
+   #Update user and service account netgroups
+   if [[ -n `grep ^memberNisNetgroup $LDIF_IN_TMP` ]]; then
+      echo "delete: memberNisNetgroup" >> $LDIF_TMP
+      echo "-" >> $LDIF_TMP
+   fi
+   if [[ -n $SUNS ]] || [[ -n $SSANS ]]; then
+
+      # Set mode
+      echo "add: memberNisNetgroup" >> $LDIF_TMP
+
+      # Add any user netgroups
+      for UNG in `echo $SUNS | sed 's/,/ /g'`;do
+         echo "memberNisNetgroup: $UNG"  >> $LDIF_TMP
+      done
+
+      # Add any SA netgroups
+      for SANG in `echo $SSANS | sed 's/,/ /g'`;do
+         echo "memberNisNetgroup: $SANG"  >> $LDIF_TMP
+      done
+
+      # Close the stanza
+      echo "-" >> $LDIF_TMP
+   fi
+
+
+   #Update description
+   echo "delete: description" >> $LDIF_TMP
+   echo "-" >> $LDIF_TMP
+
+   IPADDR=`grep "^IPADDR:" $EDITFILE | awk -F':' '{print $2}'`
+   ODESC=":::${OSER}::${HN}::${OPDT}::${LUTIME}::${IPADDR}::${JUSER}:::"
+   echo "add: Description" >> $LDIF_TMP
+   echo "Description: $ODESC" >> $LDIF_TMP
+   
+
+fi
+
+# Create a backup file for the file transfer service account
+if [[ ! -d $BACKUP_DIR ]]; then
+   mkdir -p $BACKUP_DIR
+fi
+LDIF_BAK=${BACKUP_DIR}/ng_edited_${NGTBE}_${TS}.ldif
+
+echo "## Script Name: $0" > $LDIF_BAK
+echo "## Executed By/From: `/usr/bin/who -m`" >> $LDIF_BAK
+echo "##" >> $LDIF_BAK
+echo "## Object Before Modification:" >> $LDIF_BAK
+
+# Back up the user account data
+$LDAP_SEARCH -b $NG_BASE "(cn=${NGTBE})" 2>&1 | egrep -v '^#|^$|^search|^result' >> $LDIF_BAK
+
+if [[ ! -s $LDIF_BAK ]]; then
+   echo "Error: there was a problem creating the backup file for $NGTBE"
+   exit
+fi
+
+echo "## Attempted Modification:" >> $LDIF_BAK
+echo "##" >> $LDIF_BAK
+cat $LDIF_TMP | sed 's/^/#/g' >> $LDIF_BAK
+
+
+# Verify LDAP password
+VP=FALSE
+TRIES=0
+while [[ $VP == FALSE ]] && [[ $TRIES -le $MAXTRIES ]]; do
+   read -sp "LDAP Password ($UPDATE_USER): " UUP
+   echo "$LDAP_BT \"$UUP\"" | /bin/bash 2>&1 >/dev/null
+   if [[ $? != 0 ]]; then
+      unset UUP
+      let TRIES=$TRIES+1
+   else
+      echo ""
+      VP=TRUE
+   fi
+done
+
+
+echo "$LDAP_MODIFY -w \"$UUP\" -a -f $LDIF_TMP " | /bin/bash
+if [[ $? != 0 ]]; then
+   echo "There was an error adding the object(s)"
+   echo "The command that failed was:"
+   echo "   $LDAP_MODIFY -W -a -f $LDIF_TMP"
+   echo ""
+   echo "## Update failed" >> $LDIF_BAK
+   exit
+fi
+echo "## Update succeeded" >> $LDIF_BAK
+/bin/rm $LDIF_TMP
+
+exit
+echo "Updated $NGTBE:"
+$LDAP_SEARCH -b $NG_BASE "(cn=${NGTBE})" 2>&1 | egrep -v '^#|^$|^search|^result'
+

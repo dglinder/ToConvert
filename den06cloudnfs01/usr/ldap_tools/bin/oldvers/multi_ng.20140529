@@ -1,0 +1,519 @@
+#!/bin/bash
+
+###########################################
+# Purpose: Add a netgroup to multiple other nettroups
+#          The primary use is to add/replace/remove 
+#          a user netgroup to a list of machine netgroups
+#
+# Author: SDW
+# Incept 09/05/2012
+
+# Notes: - basic LDAP authentication must already be configured and working
+#          on the server where this script is run from
+
+f_Usage () {
+   echo "$0 USAGE"
+   echo ""
+   echo "$0 <operative netgroup>[,<operative netgroup>] <mode> [<replaced netgroup>]  <target netgroup>[,<target netgroup>]"
+   echo ""
+   echo "   Adds, replaces, or removes the operative netgroup from/to one or"
+   echo "   more target netgroups."
+   echo ""
+   echo "   <operative netgroup> "
+   echo "      The name of the netgroup to be added, deleted or replaced. Multiple operative"
+   echo "      netgroups can be specified by providing a comma-separated list.  Note: you may"
+   echo "      not specify multiple operative netgroups when using \`replace\` mode."
+   echo ""
+   echo "   <mode>"
+   echo "      Can be \`add\` \`delete\` or \`replace\`.  Note, the \`replace\` mode requires"
+   echo "      the additional argument <replacement netgroup>."
+   echo ""
+   echo "   <target netgroup>"
+   echo "      The name of the netgroup to or from which the operative netgroup is added, deleted or"
+   echo "      replaced.  Multiple targets can be named by providing a comma-separated list."
+   echo ""
+}
+
+# f_GetNGDN - takes the name of a netgroup and returns a DN for it or the keyword "NOTFOUND"
+f_GetNGDN () {
+   EVAL_NG=$1 
+   if [[ -z $EVAL_NG ]]; then
+      RESULT=NOTFOUND
+   else
+      GOTDN=`$LDAP_SEARCH -b $NG_BASE "(cn=${EVAL_NG})" dn | sed ':a;N;$!ba;s/\n //g'| grep $EVAL_NG | grep ^dn: | sed 's/^dn: //g'` 
+      if [[ -z $GOTDN ]]; then
+         RESULT=NOTFOUND
+      else
+         RESULT=$GOTDN
+      fi
+   fi
+   if [[ -z $RESULT ]]; then
+      RESULT=NOTFOUND
+   fi
+
+   echo $RESULT
+   
+}
+
+
+# Set path to the location of the script no matter how it was invoked
+if [[ `echo $0 | sed 's/^.\///g'` == `basename $0` ]]; then
+   WORKDIR=`pwd`
+else
+   BASENAME=`basename $0`
+   WORKDIR=`echo $0 | sed 's/'"$BASENAME"'$//g'`
+fi
+
+cd $WORKDIR
+
+# Set some basic options for ldap searching, durrently the directory server doesn't require a binddn or a rootbinddn
+# so simple authentication should work fine
+LDAP_SEARCH="/usr/bin/ldapsearch -x -ZZ"
+UPDATE_USER=`ldapsearch -x -ZZ "(uid=$USER)" dn | grep ^dn: | sed 's/^dn:[ \t]//'`
+LDAP_MODIFY="/usr/bin/ldapmodify -x -ZZ -D \"$UPDATE_USER\""
+LDAP_BT="$LDAP_SEARCH '(ou=SUDOers)' -D \"$UPDATE_USER\" -w"
+MAXTRIES=5
+
+
+# Temp file to hold any ldif that we might need to push to the directory
+LDIF_TMP=/eit/admin/scripts/ldap_tools/tmp/.`basename $0`.$$.ldt
+LDIF_IN_TMP=/eit/admin/scripts/ldap_tools/tmp/multi.$$.ldt
+EDITFILE=/eit/admin/scripts/ldap_tools/tmp/$$.multi
+NDSE=./ndse.dat
+BACKUP_DIR=/eit/admin/scripts/ldap_tools/local_backup
+TS=`date +%Y%m%d%H%M%S`
+
+
+# find the ldap base
+if [[ -s /etc/ldap.conf ]]; then
+   LDC=/etc/ldap.conf
+elif [[ -s /etc/openldap/ldap.conf ]]; then
+   LDC=/etc/openldap/ldap.conf
+fi
+LDAP_BASE=`egrep -i "^base[ \t]" $LDC | sed 's/^base[ \t]//i'`
+
+if [[ -z $LDAP_BASE ]]; then 
+   echo "Unable to find the base dn for LDAP - please make sure ldap is properly"
+   echo "configured on this machine.  If it IS properly configured and you're"
+   echo "still getting this error, you probably need to update the LDAP_SEARCH"
+   echo "variable in this script to something that works with the current config."
+   exit
+fi
+
+# Find base DNs
+NG_BASE=`$LDAP_SEARCH '(ou=Netgroups)' | grep "dn: ou" | awk '{print $2}'`
+
+# If there is no Netgroups OU then we need to create the OU
+if [[ -z $NG_BASE ]]; then
+  echo "No Netgroup OU was found at $LDAP_BASE..."
+  echo "Please run the appropriate script from directory-setup"
+  echo "and try again."
+  exit
+fi
+
+if [[ -z $UPDATE_USER ]]; then
+   echo "Unable to locate the correct DN for your user account [$USER]."
+   echo "You must be a member of the domain in order to use this script."
+   exit
+fi
+
+# Export variables for use by functions
+
+export LDAP_SEARCH LDAP_BASE NG_BASE
+
+#### Evaluate input
+
+# Look for requests for help
+if [[ -n $1 ]] && [[ -n `echo $1 | egrep -i '^--help|-h'` ]]; then
+   f_Usage
+   exit
+fi
+
+# Look for incorrect argument counts
+if [[ $# != 3 ]] && [[ $# != 4 ]]; then
+   echo "Error: incorrect argument count"
+   f_Usage
+   exit 10
+fi
+
+# Name the arguments
+OPERATIVE_NGLIST=$1
+MODE=$2
+
+# If we get four arguments, assume we're doing a replace action
+#  This will be further verified later on
+if [[ -n $4 ]]; then
+   REPLACED_NG=$3
+   TARGET_NGLIST=$4
+else
+   TARGET_NGLIST=$3
+fi
+
+# Check to see that mode is valid
+if [[ -n $MODE ]] && [[ -z `echo $MODE | egrep '^add$|^replace$|^delete$'` ]]; then
+   echo "Error: \`${MODE}\` is not a valid mode of operation."
+   echo ""
+   f_Usage
+   exit 11
+fi
+
+# Check to see if someone is trying to provide multiple operatives with a replace action
+if [[ "$MODE" == "replace" ]] && [[ `echo ${OPERATIVE_NGLIST} | sed 's/,/ /g' | wc -w` -gt 1 ]]; then
+   echo "Error: You may not specify multiple operative netgroups with a replacement operation."
+   f_Usage
+   exit 12
+fi
+
+
+## Evaluate operative netgroup list
+
+# If we got one from the command line then...
+if [[ -n $OPERATIVE_NGLIST ]]; then
+
+   # Verify the netgroup(s) exist
+   ONG_CHECK=PASS
+   unset OPERATIVE_NGDNLIST OPERATIVE_TYPE
+   for OPERATIVE_NG in `echo ${OPERATIVE_NGLIST} | sed 's/,/ /g'`; do
+      
+      # Operative netgroups must all be the same type
+      if [[ -z $OPERATIVE_TYPE ]]; then
+         OPERATIVE_TYPE=`echo $OPERATIVE_NG | awk -F'_' '{print $NF}'`
+      else
+         if [[ "$OPERATIVE_TYPE" != "`echo $OPERATIVE_NG | awk -F'_' '{print $NF}'`" ]]; then
+            echo "ERROR: when specifying multiple operative netgroups, they must all be the"
+            echo "       same type."
+            exit 13
+         fi
+      fi      
+
+      # Attempt to get the DN for the netgroup from the directory
+      THIS_NG_DN=`f_GetNGDN $OPERATIVE_NG`
+      if [[ "$THIS_NG_DN" == "NOTFOUND" ]]; then
+         echo "ERROR: operative netgroup \"${OPERATIVE_NG}\" not found in the directory."
+         ONG_CHECK=FAIL
+      elif [[ -z `echo $OPERATIVE_NG | egrep '_users$|_machine$|_hosts$|_sa$'` ]]; then
+         echo "ERROR: operative netgroup \"${OPERATIVE_NG}\" does not conform to standards."
+         ONG_CHECK=FAIL
+      else
+         if [[ -z $OPERATIVE_NGDNLIST ]]; then
+            OPERATIVE_NGDNLIST=$THIS_NG_DN
+         else
+            OPERATIVE_NGDNLIST="${OPERATIVE_NGDNLIST}::${THIS_NG_DN}"
+         fi
+      fi
+
+   done
+   
+   # If any of the operative netgroups failed the check, then exit with an error code
+   if [[ $ONG_CHECK != PASS ]]; then
+      exit 14
+   fi
+
+# If we did NOT get an operative netgroup list from the command line...
+else
+  echo "Error: no operative netgroup specified."
+  f_Usage
+  exit 15
+
+fi
+
+
+## Evaluate Replacement netgroup, if we have one
+if [[ -n $REPLACED_NG ]]; then
+
+   # Check to see that the mode specified is "replace"
+   if [[ "$MODE" != "replace" ]]; then
+      echo "Error: incorrect argument count for mode \`$MODE\`"
+      exit 16
+   fi
+   
+   # Verify the replacement netgroup exists in the directory
+   REPLACED_NGDN=`f_GetNGDN $REPLACED_NG`
+   if [[ "$REPLACED_NGDN" == "NOTFOUND" ]]; then
+      echo "ERROR: replacement netgroup \"${OPERATIVE_NG}\" not found in the directory."
+      exit 17
+   fi
+
+   # Verify that the replacement netgroup is the same type as the operative
+   REPLACED_TYPE=`echo $REPLACED_NG | awk -F'_' '{print $NF}'`
+   if [[ "$REPLACED_TYPE" != "$OPERATIVE_TYPE" ]]; then
+      echo "ERROR: attempt to replace $OPERATIVE_TYPE netgroup with $REPLACED_TYPE netgroup."
+      echo "       netgroups may only be replaced with another netgroup of the same type."
+      exit 18
+   fi
+   
+fi
+
+## Evaluate Target netgroup(s).
+# If we got one from the command line then...
+if [[ -n $TARGET_NGLIST ]]; then
+
+   # Verify the netgroup(s) exist
+   TNG_CHECK=PASS
+   unset TARGET_NGDNLIST TARGET_TYPE
+   for TARGET_NG in `echo ${TARGET_NGLIST} | sed 's/,/ /g'`; do
+
+      # Operative netgroups must all be the same type
+      if [[ -z $TARGET_TYPE ]]; then
+         TARGET_TYPE=`echo $TARGET_NG | awk -F'_' '{print $NF}'`
+      else
+         if [[ "$TARGET_TYPE" != "`echo $TARGET_NG | awk -F'_' '{print $NF}'`" ]]; then
+            echo "ERROR: when specifying multiple target netgroups, they must all be the"
+            echo "       same type."
+            exit 19
+         fi
+      fi
+
+      # Verify the target netgroup is not locked
+      TARGET_LSTATE=`$LDAP_SEARCH -b $NG_BASE "(cn=${TARGET_NG})" filterInfo | grep ^filterInfo: | sed 's/^filterInfo:[ \t]//g'`
+      if [[ -n $LSTATE ]] && [[ $LSTATE == 1 ]]; then
+         echo "ERROR: the target netgroup [${TARGETNG}] is administratively locked"
+         echo "       and may not be edited."
+         TNG_CHECK=FAIL
+      fi
+
+      # Attempt to get the DN for the netgroup from the directory
+      THIS_NG_DN=`f_GetNGDN $TARGET_NG`
+      if [[ "$THIS_NG_DN" == "NOTFOUND" ]]; then
+         echo "ERROR: target netgroup \"${TARGET_NG}\" not found in the directory."
+         TNG_CHECK=FAIL
+      elif [[ -z `echo $TARGET_NG | egrep '_users$|_machine$|_hosts$|_sa$'` ]]; then
+         echo "ERROR: target netgroup \"${TARGET_NG}\" does not conform to standards."
+         TNG_CHECK=FAIL
+      else
+         if [[ -z $TARGET_NGDNLIST ]]; then
+            TARGET_NGDNLIST=$THIS_NG_DN
+         else
+            TARGET_NGDNLIST="${TARGET_NGDNLIST}::${THIS_NG_DN}"
+         fi
+      fi
+
+   done
+
+   # If any of the operative netgroups failed the check, then exit with an error code
+   if [[ $ONG_CHECK != PASS ]]; then
+      exit 20 
+   fi
+
+# If we did NOT get an operative netgroup list from the command line...
+else
+  echo "Error: no target netgroup specified."
+  f_Usage
+  exit 21
+
+fi
+
+# Final checks
+
+## Verify the operative to target relationship is permissible
+# Only the following combinations are allowed:
+#
+# Operative	Target
+# -------------------------------------
+# users		users
+# users		machine
+# sa		sa
+# sa		machine
+# machine	hosts
+# hosts		hosts
+
+ALLOWED_MODE=FALSE
+
+if [[ "$OPERATIVE_TYPE" == "users" ]] && ( [[ "$TARGET_TYPE" == "users" ]] || [[ "$TARGET_TYPE" == "machine" ]] ); then
+   ALLOWED_MODE=TRUE
+fi
+
+if [[ "$OPERATIVE_TYPE" == "sa" ]] && ( [[ "$TARGET_TYPE" == "sa" ]] || [[ "$TARGET_TYPE" == "machine" ]] ); then
+   ALLOWED_MODE=TRUE
+fi
+
+if [[ "$OPERATIVE_TYPE" == "machine" ]] && [[ "$TARGET_TYPE" == "hosts" ]]; then
+   ALLOWED_MODE=TRUE
+fi
+
+if [[ "$OPERATIVE_TYPE" == "hosts" ]] && [[ "$TARGET_TYPE" == "hosts" ]]; then
+   ALLOWED_MODE=TRUE
+fi
+
+if [[ $ALLOWED_MODE != TRUE ]]; then
+   echo "Error: a $OPERATIVE_TYPE netgroup cannot be added to a $TARGET_TYPE netgroup."
+   exit 22
+fi
+
+
+# Build our LDIF based on the new information, we'll be replacing the values
+# with whatever was read in from the edited file
+
+if [[ -f $LDIF_TMP ]]; then
+   /bin/rm $LDIF_TMP
+fi
+
+
+# For each target DN verified...
+for TARGET_NGDN in `echo $TARGET_NGDNLIST | sed 's/::/ /g'`; do
+   
+   if [[ "$MODE" == "add" ]]; then
+
+      # Counts the number of members added to a given target
+      ADD_COUNT=0
+
+      for OPERATIVE_NG in `echo $OPERATIVE_NGLIST | sed 's/,/ /g'`; do
+
+         unset IS_A_MEMBER
+
+         # Check to see if the operative ng is currently a member of the target ng
+         if [[ -n `$LDAP_SEARCH -b "$TARGET_NGDN" "(memberNisNetgroup=$OPERATIVE_NG)" dn | grep "^dn:"` ]]; then
+            IS_A_MEMBER=TRUE
+         else
+            let ADD_COUNT=$ADD_COUNT+1
+         fi
+
+         # Only add the heading the first time we encounter a netgroup that needs to be added
+         if [[ -z $IS_A_MEMBER ]] && [[ $ADD_COUNT -eq 1 ]]; then
+            echo "" >> $LDIF_TMP
+            echo "dn: $TARGET_NGDN" >> $LDIF_TMP
+            echo "changetype: modify" >> $LDIF_TMP
+            echo "add: memberNisNetgroup" >> $LDIF_TMP
+         fi
+
+         # Only need to add if the operative is not already a member of the target
+         if [[ $IS_A_MEMBER != TRUE ]]; then
+            echo "memberNisNetgroup: $OPERATIVE_NG" >> $LDIF_TMP
+         fi
+      done
+     
+      # Only add the closing if we actually added a heading and operations
+      if [[ $ADD_COUNT -gt 0 ]]; then
+         echo "-" >> $LDIF_TMP
+         echo "" >> $LDIF_TMP
+      fi   
+
+   elif [[ "$MODE" == "delete" ]]; then
+
+      # Counts the number of members removed from a given target
+      REM_COUNT=0
+
+      for OPERATIVE_NG in `echo $OPERATIVE_NGLIST | sed 's/,/ /g'`; do
+
+         unset IS_A_MEMBER
+
+         # Check to see if the operative ng is currently a member of the target ng
+         if [[ -n `$LDAP_SEARCH -b "$TARGET_NGDN" "(memberNisNetgroup=$OPERATIVE_NG)" dn | grep "^dn:"` ]]; then
+            IS_A_MEMBER=TRUE
+            let REM_COUNT=$REM_COUNT+1
+         fi
+
+         # Only add the heading the first time we encounter a netgroup that needs to be removed
+         if [[ $IS_A_MEMBER == TRUE ]] && [[ $REM_COUNT -eq 1 ]]; then
+            echo "" >> $LDIF_TMP
+            echo "dn: $TARGET_NGDN" >> $LDIF_TMP
+            echo "changetype: modify" >> $LDIF_TMP
+            echo "delete: memberNisNetgroup" >> $LDIF_TMP
+         fi
+
+         # Only need to add if the operative is not already a member of the target
+         if [[ $IS_A_MEMBER == TRUE ]]; then
+            echo "memberNisNetgroup: $OPERATIVE_NG" >> $LDIF_TMP
+         fi
+      done
+     
+      # Only add the closing if we actually added a heading and operations
+      if [[ $REM_COUNT -gt 0 ]]; then
+         echo "-" >> $LDIF_TMP
+         echo "" >> $LDIF_TMP
+      fi
+
+   elif [[ "$MODE" == "replace" ]]; then
+      # The simplest way to approach the replace is to process a delete, then an add
+      
+      # Delete the replaced NG from the target only if it is actually a member
+      if [[ -n `$LDAP_SEARCH -b "$TARGET_NGDN" "(memberNisNetgroup=$REPLACED_NG)" dn | grep "^dn:"` ]]; then
+         echo "" >> $LDIF_TMP
+         echo "dn: $TARGET_NGDN" >> $LDIF_TMP
+         echo "changetype: modify" >> $LDIF_TMP
+         echo "delete: memberNisNetgroup" >> $LDIF_TMP
+         echo "memberNisNetgroup: $REPLACED_NG" >> $LDIF_TMP
+         echo "-" >> $LDIF_TMP
+         echo "" >> $LDIF_TMP
+      fi
+
+      # Add the new netgroup - only one operative group is allowed here - any multiples should be caught upstream
+      echo "" >> $LDIF_TMP
+      echo "dn: $TARGET_NGDN" >> $LDIF_TMP
+      echo "changetype: modify" >> $LDIF_TMP
+      echo "add: memberNisNetgroup" >> $LDIF_TMP
+      echo "memberNisNetgroup: $OPERATIVE_NG" >> $LDIF_TMP
+      echo "-" >> $LDIF_TMP
+      echo "" >> $LDIF_TMP
+
+   fi
+
+done
+
+if [[ ! -s $LDIF_TMP ]]; then
+   echo "Nothing to do"
+   exit 0
+fi
+
+# Create a backup file before proceeding
+if [[ ! -d $BACKUP_DIR ]]; then
+   mkdir -p $BACKUP_DIR
+fi
+LDIF_BAK=${BACKUP_DIR}/`basename $0`$$.${TS}.ldif
+
+echo "## Script Name: $0" > $LDIF_BAK
+echo "## Executed By/From: `/usr/bin/who -m`" >> $LDIF_BAK
+echo "##" >> $LDIF_BAK
+echo "## Objects Before Modification:" >> $LDIF_BAK
+
+# Back up the pre-modification objects
+for TARGET_NGDN in `echo $TARGET_NGDNLIST | sed 's/::/ /g'`; do
+
+   echo "" >> $LDIF_BAK
+   echo "## Object: $TARGET_NGDN" >> $LDIF_BAK
+   $LDAP_SEARCH -b $TARGET_NGDN 2>&1 | egrep -v '^#|^$|^search|^result' >> $LDIF_BAK
+   echo "" >> $LDIF_BAK
+done
+
+if [[ ! -s $LDIF_BAK ]]; then
+   echo "Error: there was a problem creating the backup file."
+   exit
+fi
+
+echo "## Attempted Modification:" >> $LDIF_BAK
+echo "##" >> $LDIF_BAK
+cat $LDIF_TMP | sed 's/^/#/g' >> $LDIF_BAK
+
+
+# Verify LDAP password
+VP=FALSE
+TRIES=0
+while [[ $VP == FALSE ]] && [[ $TRIES -le $MAXTRIES ]]; do
+   read -sp "LDAP Password ($UPDATE_USER): " UUP
+   echo "$LDAP_BT \"$UUP\"" | /bin/bash 2>&1 >/dev/null
+   if [[ $? != 0 ]]; then
+      unset UUP
+      let TRIES=$TRIES+1
+   else
+      echo ""
+      VP=TRUE
+   fi
+done
+
+
+echo "$LDAP_MODIFY -w \"$UUP\" -a -f $LDIF_TMP " | /bin/bash
+if [[ $? != 0 ]]; then
+   echo "There was an error adding the object(s)"
+   echo "The command that failed was:"
+   echo "   $LDAP_MODIFY -W -a -f $LDIF_TMP"
+   echo ""
+   echo "## Update failed" >> $LDIF_BAK
+   exit
+fi
+echo "## Update succeeded" >> $LDIF_BAK
+/bin/rm $LDIF_TMP
+
+exit
+echo "Updated $NGTBE:"
+$LDAP_SEARCH -b $NG_BASE "(cn=${NGTBE})" 2>&1 | egrep -v '^#|^$|^search|^result'
+

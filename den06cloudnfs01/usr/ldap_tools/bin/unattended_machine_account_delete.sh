@@ -1,0 +1,332 @@
+#!/bin/bash
+
+###########################################
+# Purpose: Deletes the identified machine account from the directory
+# Author: SDW
+# Incept 20140909
+
+# Notes: - basic LDAP authentication must already be configured and working
+#          on the server where this script is run from
+
+f_Usage () {
+   echo "$0 USAGE"
+   echo ""
+   echo "$0 -h <hostname> -s <serial> -pn <product name> -ip <ip adress> -ru <requesting user> -bg <business group>"
+   echo ""
+}
+
+
+
+# Set path to the location of the script no matter how it was invoked
+if [[ `echo $0 | sed 's/^.\///g'` == `basename $0` ]]; then
+   WORKDIR=`pwd`
+else
+   BASENAME=`basename $0`
+   WORKDIR=`echo $0 | sed 's/'"$BASENAME"'$//g'`
+fi
+
+cd $WORKDIR
+
+# Source the environment file
+. /usr/ldap_tools/bin/ldap_env.sh
+
+
+# Define external scripts
+LSNETGROUP="/usr/ldap_tools/bin/lsnetgroup"
+
+# Configure logging
+LOGFILE="${LOG_DIR}/${TS}.`basename $0`"
+
+
+# Start logging
+echo "${TS}:`basename $0`:Executed by $USER ($EUID):Arguments $@" >> $LOGFILE
+
+# Temp file to hold any ldif that we might need to push to the directory
+LDIF_TMP=/usr/ldap_tools/tmp/.`basename $0`.$$.ldt
+echo "${TS}:`basename $0`:TMP file $LDIF_TMP" >> $LOGFILE
+
+# Get information from the command line
+# Arguments may contain spaces so we'll override the field separator to identify them
+
+#RAW_HOSTNAME=`echo $@ | awk -F'-h' '{print $2}' | awk -F' -' '{print $1}'`
+#echo "${TS}:`basename $0`:INFO: RAW_HOSTNAME=${RAW_HOSTNAME}" >> $LOGFILE
+#RAW_SERIAL=`echo $@ | awk -F'-s' '{print $2}' | awk -F' -' '{print $1}'`
+#echo "${TS}:`basename $0`:INFO: SERIAL=${SERIAL}" >> $LOGFILE
+#PN=`echo $@ | awk -F'-pn' '{print $2}' | awk -F' -' '{print $1}'`
+#echo "${TS}:`basename $0`:INFO: PN=${PN}" >> $LOGFILE
+#IPADDR=`echo $@ | awk -F'-ip' '{print $2}' | awk -F' -' '{print $1}' | sed 's/^ //g'`
+#echo "${TS}:`basename $0`:INFO: IPADDR=${IPADDR}" >> $LOGFILE
+#REQUESTING_USER=`echo $@ | awk -F'-ru' '{print $2}' | awk -F' -' '{print $1}'`
+#echo "${TS}:`basename $0`:INFO: REQUESTING_USER=${REQUESTING_USER}" >> $LOGFILE
+#BUSINESS_GROUP=`echo $@ | awk -F'-bg' '{print $2}' | awk -F' -' '{print $1}'`
+#echo "${TS}:`basename $0`:INFO: BUSINESS_GROUP=${BUSINESS_GROUP}" >> $LOGFILE
+
+# Get information from the command line
+
+RAW_HOSTNAME=`echo $@ | awk -F'-h' '{print $2}' | awk -F' -' '{print $1}' | sed 's/^ //g;s/ $//g'`
+echo "${TS}:`basename $0`:INFO: RAW_HOSTNAME=[${RAW_HOSTNAME}]" >> $LOGFILE
+RAW_SERIAL=`echo $@ | awk -F'-s' '{print $2}' | awk -F' -' '{print $1}' | sed 's/^ //g;s/ $//g'`
+echo "${TS}:`basename $0`:INFO: SERIAL=[${SERIAL}]" >> $LOGFILE
+PN=`echo $@ | awk -F'-pn' '{print $2}' | awk -F' -' '{print $1}' | sed 's/^ //g;s/ $//g'`
+echo "${TS}:`basename $0`:INFO: PN=[${PN}]" >> $LOGFILE
+IPADDR=`echo $@ | awk -F'-ip' '{print $2}' | awk -F' -' '{print $1}' | sed 's/^ //g'`
+echo "${TS}:`basename $0`:INFO: IPADDR=[${IPADDR}]" >> $LOGFILE
+REQUESTING_USER=`echo $@ | awk -F'-ru' '{print $2}' | awk -F' -' '{print $1}' | sed 's/^ //g;s/ $//g'`
+echo "${TS}:`basename $0`:INFO: REQUESTING_USER=[${REQUESTING_USER}]" >> $LOGFILE
+BUSINESS_GROUP=`echo $@ | awk -F'-bg' '{print $2}' | awk -F' -' '{print $1}' | tr '[:lower:]' '[:upper:]' | sed 's/^ //g;s/ $//g'`
+echo "${TS}:`basename $0`:INFO: BUSINESS_GROUP=[${BUSINESS_GROUP}]" >> $LOGFILE
+
+
+if [[ $# -le 0 ]]; then
+   f_Usage
+   exit 0
+fi
+
+VALID_ARGS=TRUE
+# Verify required arguments
+if [[ -z $RAW_HOSTNAME ]]; then
+   echo "ERROR: hostname not provided"
+   echo "${TS}:`basename $0`:ERROR: hostname not provided" >> $LOGFILE
+   VALID_ARGS=FALSE
+fi
+if [[ -z $RAW_SERIAL ]]; then
+   echo "ERROR: system serial not provided"
+   echo "${TS}:`basename $0`:ERROR: system serial not provided" >> $LOGFILE
+   VALID_ARGS=FALSE
+fi
+if [[ -z $PN ]]; then
+   echo "ERROR: product name not provided"
+   echo "${TS}:`basename $0`:ERROR: product name not provided" >> $LOGFILE
+   VALID_ARGS=FALSE
+fi
+if [[ -z $IPADDR ]]; then
+   echo "ERROR: IP address not provided"
+   echo "${TS}:`basename $0`:ERROR: IP address not provided" >> $LOGFILE
+   VALID_ARGS=FALSE
+fi
+if [[ -z $REQUESTING_USER ]]; then
+   echo "ERROR: requesting user not provided"
+   echo "${TS}:`basename $0`:ERROR: requesting user not provided" >> $LOGFILE
+   VALID_ARGS=FALSE
+fi
+if [[ -z $BUSINESS_GROUP ]]; then
+   echo "ERROR: business group not provided"
+   echo "${TS}:`basename $0`:ERROR: business group not provided" >> $LOGFILE
+   VALID_ARGS=FALSE
+fi
+
+if [[ $VALID_ARGS == FALSE ]]; then
+   echo "FAILURE: Required arguments missing"
+   echo "${TS}:`basename $0`:FAILURE: required arguments missing - exiting with code 7" >> $LOGFILE
+   exit 7
+fi
+  
+
+
+SUFFIX="_machine"
+SUBOU="Machines"
+
+NAME=`echo $RAW_HOSTNAME | /bin/awk -F'.' '{print $1}'`
+
+# Reformat the serial number
+# This will reformat either a standard VMware serial OR a UUID ito a standard VMware serial
+SERIAL=`echo $RAW_SERIAL | sed 's/VMware//gI;s/ //g;s/-//g;s/\(.*\)/\L\1/;s/.\{2\}/&\ /g;s/./-/24;s/^/ VMware-/;s/^ //g;s/ $//g'`
+#SERIAL=`echo $RAW_SERIAL | sed 's/VMware//gI;s/ //g;s/-//g;s/\(.*\)/\L\1/;s/.\{2\}/&\ /g;s/./-/24;s/^/ VMware-/'`
+
+
+
+# If we got a name from the command line
+if [[ -n $NAME ]]; then
+   # Remove unsafe characters from the name
+   SNAME=`echo $NAME | tr -d '\`!@$%^&*()+=/|[]{}:;"\\'\''' | sed 's/_users$//; s/_hosts//; s/_sa$//; s/_machine//'`
+   echo "${TS}:`basename $0`:INFO: sanitized name set to $SNAME" >> $LOGFILE
+
+   # Construct the netgroup name to be deleted by adding the suffix
+   NGTBD="${SNAME}${SUFFIX}"
+   echo "${TS}:`basename $0`:INFO: Netgroup to be deleted is $NGTBD" >> $LOGFILE
+
+   # Verify the netgroup exists
+   if [[ -z `$LDAP_SEARCH -b $NG_BASE "(cn=${NGTBD})" 2>&1 | egrep -v '^#|^$|^search|^result'` ]]; then
+      echo "ERROR: netgroup \"$NGTBD\" not found in the directory."
+      echo "${TS}:`basename $0`:FAILURE: Netgroup $NGTBD does not exist in the directory - exiting code 8" >> $LOGFILE
+      exit 8
+   else
+      NGTBDDN=`$LDAP_SEARCH -b $NG_BASE "(cn=${NGTBD})" dn | sed ':a;N;$!ba;s/\n //g' | grep $NGTBD | grep ^dn: | sed 's/^dn: //g'`
+      echo "${TS}:`basename $0`:INFO: DN for Netgroup to be deleted is $NGTBDDN" >> $LOGFILE
+   fi
+
+# If we did NOT get a name from the command line 
+else 
+
+   # Exit with an error
+   echo "ERROR: machine name not received on command line"
+   echo "${TS}:`basename $0`:FAILURE: machine name not derrived from command line - exiting code 2" >> $LOGFILE
+   exit 2
+fi
+
+# Protect certain nggroups
+PROTECTED_NGS="
+UnixAdmin_users
+oma00ds01_machine
+oma00ds01_machine
+"
+
+for PROTECTED_NG in $PROTECTED_NGS; do
+   if [[ -n `echo $PROTECTED_NG | grep -i "^${NGTBD}$"` ]]; then
+      echo "Error: Cannot delete [$NGTBD] as doing so would damage the directory."
+      echo "${TS}:`basename $0`:FAILURE: attempt to delete protected Netgroup $NGTBD - exiting code 6" >> $LOGFILE
+      exit 6 
+   fi
+done
+
+# Check the netgroup's attributes against the input to ensure that they actually match
+DSTRING=`$LDAP_SEARCH -b "$NGTBDDN" description | sed ':a;N;$!ba;s/\n //g' | grep "^description:"`
+
+
+if [[ -n `echo $DSTRING | grep -i "^description::"` ]]; then
+    BASE64DESC=`echo $DSTRING | grep -i "^description::" | sed 's/^description:://i'`
+    DESC=`echo $BASE64DESC | perl -MMIME::Base64 -0777 -ne 'print decode_base64($_)'`
+elif [[ -n `echo $DSTRING | grep -i "^description:"` ]]; then
+    DESC=`echo $DSTRING | grep -i "^description:" | sed 's/^description://i'`
+fi
+
+## Description: :::$SERIAL::$SNAME::$PN::$TIME::$IPADDR::$REQUESTING_USER:::
+#FOUND_SERIAL=`echo $DESC | awk -F':::' '{print $2}' | awk -F'::' '{print $1}'`
+#echo "${TS}:`basename $0`:INFO: FOUND_SERIAL=${FOUND_SERIAL}" >> $LOGFILE
+#FOUND_NAME=`echo $DESC | awk -F':::' '{print $2}' | awk -F'::' '{print $2}'`
+#echo "${TS}:`basename $0`:INFO: FOUND_NAME=${FOUND_NAME}" >> $LOGFILE
+#FOUND_PN=`echo $DESC | awk -F':::' '{print $2}' | awk -F'::' '{print $3}'`
+#echo "${TS}:`basename $0`:INFO: FOUND_PN=${FOUND_PN}" >> $LOGFILE
+#LUTIME=`echo $DESC | awk -F':::' '{print $2}' | awk -F'::' '{print $4}'`
+#echo "${TS}:`basename $0`:INFO: FOUND_LUTIME=${FOUND_LUTIME}" >> $LOGFILE
+#FOUND_IPADDR=`echo $DESC | awk -F':::' '{print $2}' | awk -F'::' '{print $5}'`
+#echo "${TS}:`basename $0`:INFO: FOUND_IPADDR=${FOUND_IPADDR}" >> $LOGFILE
+#FOUND_REQUESTING_USER=`echo $DESC | awk -F':::' '{print $2}' | awk -F'::' '{print $6}'`
+#echo "${TS}:`basename $0`:INFO: FOUND_REQUESTING_USER=${FOUND_REQUESTING_USER}" >> $LOGFILE
+
+# Description: :::$SERIAL::$SNAME::$PN::$TIME::$IPADDR::$REQUESTING_USER:::
+FOUND_SERIAL=`echo $DESC | awk -F':::' '{print $2}' | awk -F'::' '{print $1}' | sed 's/^ //g;s/ $//g'`
+echo "${TS}:`basename $0`:INFO: FOUND_SERIAL=[${FOUND_SERIAL}]" >> $LOGFILE
+FOUND_NAME=`echo $DESC | awk -F':::' '{print $2}' | awk -F'::' '{print $2}' | sed 's/^ //g;s/ $//g'`
+echo "${TS}:`basename $0`:INFO: FOUND_NAME=[${FOUND_NAME}]" >> $LOGFILE
+FOUND_PN=`echo $DESC | awk -F':::' '{print $2}' | awk -F'::' '{print $3}' | sed 's/^ //g;s/ $//g'`
+echo "${TS}:`basename $0`:INFO: FOUND_PN=[${FOUND_PN}]" >> $LOGFILE
+LUTIME=`echo $DESC | awk -F':::' '{print $2}' | awk -F'::' '{print $4}' | sed 's/^ //g;s/ $//g'`
+echo "${TS}:`basename $0`:INFO: FOUND_LUTIME=[${FOUND_LUTIME}]" >> $LOGFILE
+FOUND_IPADDR=`echo $DESC | awk -F':::' '{print $2}' | awk -F'::' '{print $5}' | sed 's/^ //g;s/ $//g'`
+echo "${TS}:`basename $0`:INFO: FOUND_IPADDR=[${FOUND_IPADDR}]" >> $LOGFILE
+FOUND_REQUESTING_USER=`echo $DESC | awk -F':::' '{print $2}' | awk -F'::' '{print $6}' | sed 's/^ //g;s/ $//g'`
+echo "${TS}:`basename $0`:INFO: FOUND_REQUESTING_USER=[${FOUND_REQUESTING_USER}]" >> $LOGFILE
+
+# Check for matches to critical pieces
+ATTMATCH=TRUE
+if [[ "$FOUND_SERIAL" != "$SERIAL" ]]; then
+   echo "Serial number in machine netgroup does not match request"
+   echo "${TS}:`basename $0`:ERROR: serial from request [$SERIAL] does not match serial from Netgroup [$FOUND_SERIAL]" >> $LOGFILE
+   ATTMATCH=FALSE
+fi
+if [[ "$FOUND_NAME" != "$NAME" ]]; then
+   echo "Name in machine netgroup does not match request"
+   echo "${TS}:`basename $0`:ERROR: hostname from request [$NAME] does not match hostname from Netgroup [$FOUND_NAME]" >> $LOGFILE
+   ATTMATCH=FALSE
+fi
+if [[ "$FOUND_PN" != "$PN" ]]; then
+   echo "Product name in machine netgroup does not match request"
+   echo "${TS}:`basename $0`:ERROR: product name from request [$PN] does not match product name from Netgroup [$FOUND_PN]" >> $LOGFILE
+   ATTMATCH=FALSE
+fi
+
+if [[ "$ATTMATCH" != "TRUE" ]]; then
+   echo "Request does not match netgroup in directory, manual intervention required"
+   echo "${TS}:`basename $0`:FAILURE: delete request does not match Netgroup in the directory - exiting code 11" >> $LOGFILE
+   exit 11
+fi
+
+
+# Get all netgroups which have this one as a member
+
+PNGS=`$LSNETGROUP -M $NGTBD`
+
+# Create a backup file for the netgroup
+if [[ ! -d $BACKUP_DIR ]]; then
+   mkdir -p $BACKUP_DIR
+fi
+LDIF_BAK=${BACKUP_DIR}/ng_deleted_${NGTBD}_${TS}.ldif
+
+echo "${TS}:`basename $0`:INFO: defining backup file as $LDIF_BAK" >> $LOGFILE
+
+echo "## Script Name: $0" > $LDIF_BAK
+echo "## Executed By/From: `/usr/bin/who -m`" >> $LDIF_BAK
+echo "##" >> $LDIF_BAK
+
+$LDAP_SEARCH -b $NG_BASE "(cn=${NGTBD})" 2>&1 | egrep -v '^#|^$|^search|^result' >> $LDIF_BAK
+
+if [[ ! -s $LDIF_BAK ]]; then
+   echo "Error: there was a problem creating the backup file for $NGTBD"
+   echo "${TS}:`basename $0`:FAILURE: there was a problem creating the backup file for $NGTBD - exiting code 12" >> $LOGFILE
+   exit 12
+#else
+#   echo "Backup created: $LDIF_BAK"
+fi
+
+# Create ldif to delete the netgroup
+cat << EOF > $LDIF_TMP
+dn: $NGTBDDN
+changetype: delete
+EOF
+
+# Get all netgroups which have this one as a member
+
+PNGS=`$LSNETGROUP -M $NGTBD`
+if [[ -n $PNGS ]]; then 
+   echo "\"$NGTBD\" will also be removed from parent netgroups: $PNGS"
+   echo "${TS}:`basename $0`:INFO: Netgroup $NGTBD will also be removed from parent netgroup: $PNGS" >> $LOGFILE
+fi
+
+
+for PNG in $PNGS; do
+   PNGDN=`$LDAP_SEARCH -b $NG_BASE "(cn=${PNG})" dn | grep ^dn: | sed 's/^dn: //g'`
+cat << EOF >> $LDIF_BAK
+dn: $PNGDN
+changetype: modify
+add: memberNisNetgroup
+memberNisNetgroup: $NGTBD
+
+EOF
+
+cat << EOF >> $LDIF_TMP
+
+dn: $PNGDN
+changetype: modify
+delete: memberNisNetgroup
+memberNisNetgroup: $NGTBD
+EOF
+done
+
+# Process the deletion
+echo "$LDAP_BT" | /bin/bash 2>&1 >/dev/null
+if [[ $? != 0 ]]; then
+   echo "Error: bind DN $UPDATE_USER or password not accepted by LDAP server"
+   echo "${TS}:`basename $0`:FAILURE: bind DN $UPDATE_USER or password not accepted by LDAP server - exiting code 4" >> $LOGFILE
+   exit 4
+else
+
+   #echo "   $LDAP_MODIFY -a -f $LDIF_TMP"
+   #echo "   $LDIF_BAK"
+   #exit
+   echo "$LDAP_MODIFY -w \"$UPDATE_PASS\" -a -f $LDIF_TMP " | /bin/bash
+   if [[ $? != 0 ]]; then
+      echo "There was an error adding the object(s)"
+      echo "The command that failed was:"
+      echo "   $LDAP_MODIFY -a -f $LDIF_TMP"
+      echo ""
+      echo "## Update failed" >> $LDIF_BAK
+      echo "${TS}:`basename $0`:FAILURE: LDAP update ended with a non-zero return code. $LDIF_TMP is being preserved for troubleshooting - exiting code 5" >> $LOGFILE
+      exit 5
+   fi
+   echo "## Update succeeded" >> $LDIF_BAK
+   echo "${TS}:`basename $0`:INFO: LDAP update completed successfully - log ends" >> $LOGFILE
+   /bin/rm $LDIF_TMP
+fi
+
+exit 0

@@ -1,0 +1,54 @@
+[domain/default]
+enumerate = True
+autofs_provider = ldap
+sudo_provider = ldap
+ldap_sudo_full_refresh_interval=86400
+ldap_sudo_smart_refresh_interval=3600
+ldap_schema = rfc2307bis
+ldap_search_base = dc=ds,dc=west,dc=com
+ldap_sudo_search_base = ou=SUDOers,dc=ds,dc=west,dc=com
+id_provider = ldap
+auth_provider = ldap
+chpass_provider = none
+access_provider = permit
+; XX-SSSDTEMPLATE_filter
+; XX-SSSDTEMPLATE_ldapuri
+ldap_id_use_start_tls = False
+cache_credentials = True
+ldap_tls_cacertdir = /etc/openldap/cacerts
+ldap_tls_cacert = /etc/openldap/cacerts/authconfig_downloaded.pem
+
+[domain/local]
+;;not used
+; enumerate = TRUE
+; id_provider = local
+; auth_provider = local
+
+[sssd]
+services = nss,pam,autofs,sudo
+config_file_version = 2
+
+domains = default
+
+[nss]
+;;not used
+; homedir_substring = /home
+
+[pam]
+;;not used
+; chpass_provider = none
+
+[sudo]
+;;currently defined in the default domain
+; sudo_provider = ldap
+; ldapuri
+; ldap_sudo_search_base = ou=SUDOers,dc=ds,dc=west,dc=com
+
+[autofs]
+
+[ssh]
+
+[pac]
+
+[ifp]
+
